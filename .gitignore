@@ -1,0 +1,44 @@
+# ROS bag / recorded data
+*.db3
+*.sqlite3
+*.mcap
+*.bag
+*.bag.active
+*.db3-shm
+*.db3-wal
+
+# Route/test data folders
+test_route_*/
+rosbag2_*/
+
+# Python cache / packaging
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ROS 2 / colcon generated files
+build/
+install/
+log/
+autoware_eval_ws/build/
+autoware_eval_ws/install/
+autoware_eval_ws/log/
+
+# Cache / generated files
+osm_tile_cache/
+_autoware_gif_frames/
+
+# Generated reports and figures
+*_heatmap.png
+*_evaluation_report.pdf
+*_report.pdf
+summary_report.csv
+lateral_errors.csv
+heading_errors.csv
+velocity_errors.csv
+brake_events.csv

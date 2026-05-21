@@ -13,6 +13,7 @@ from PIL import Image
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
@@ -47,18 +48,38 @@ def webmercator_to_latlon(x, y):
     return lat, lon
 
 
-def local_xy_to_latlon(x, y, origin_lat, origin_lon, origin_yaw_deg=0.0):
-    origin_x, origin_y = latlon_to_webmercator(origin_lat, origin_lon)
-
+def rotate_local_xy_to_enu(x, y, origin_yaw_deg=0.0):
     yaw = math.radians(origin_yaw_deg)
 
     east = math.cos(yaw) * x - math.sin(yaw) * y
     north = math.sin(yaw) * x + math.cos(yaw) * y
 
-    mx = origin_x + east
-    my = origin_y + north
+    return east, north
 
-    return webmercator_to_latlon(mx, my)
+
+def make_local_to_latlon_transformer(origin_lat, origin_lon):
+    local_crs = (
+        f"+proj=aeqd +lat_0={origin_lat} +lon_0={origin_lon} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+    return Transformer.from_crs(local_crs, "EPSG:4326", always_xy=True)
+
+
+def local_xy_to_latlon(
+    x,
+    y,
+    origin_lat,
+    origin_lon,
+    origin_yaw_deg=0.0,
+    local_to_latlon=None,
+):
+    if local_to_latlon is None:
+        local_to_latlon = make_local_to_latlon_transformer(origin_lat, origin_lon)
+
+    east, north = rotate_local_xy_to_enu(x, y, origin_yaw_deg)
+    lon, lat = local_to_latlon.transform(east, north)
+
+    return lat, lon
 
 
 def latlon_to_tile(lat, lon, zoom):
@@ -387,6 +408,8 @@ def get_accel_at_time(accels, t):
 
 
 def convert_poses_to_global(poses, origin_lat, origin_lon, origin_yaw_deg):
+    local_to_latlon = make_local_to_latlon_transformer(origin_lat, origin_lon)
+
     for p in poses:
         lat, lon = local_xy_to_latlon(
             p["x"],
@@ -394,6 +417,7 @@ def convert_poses_to_global(poses, origin_lat, origin_lon, origin_yaw_deg):
             origin_lat,
             origin_lon,
             origin_yaw_deg,
+            local_to_latlon,
         )
 
         mx, my = latlon_to_webmercator(lat, lon)
@@ -503,31 +527,51 @@ def create_heatmap_png(
         heat = weighted_sum / np.maximum(counts, 1.0)
         heat[counts == 0] = np.nan
 
+    heat_cmap = plt.get_cmap(cmap).copy()
+    heat_cmap.set_bad(alpha=0.0)
+    heat_masked = np.ma.masked_invalid(heat.T)
+
     fig, ax = plt.subplots(figsize=(14, 14), dpi=200)
 
     ax.imshow(background, extent=extent, origin="upper")
 
-    # driven route line
+    # route outline, kept under the heat colors for contrast
     ax.plot(
         xs,
         ys,
         color="black",
-        linewidth=1.5,
-        alpha=0.55,
+        linewidth=5.0,
+        alpha=0.35,
         label="Driven route",
         zorder=5,
     )
 
     # heatmap overlay
     im = ax.imshow(
-        heat.T,
+        heat_masked,
         extent=extent,
         origin="lower",
-        cmap=cmap,
+        cmap=heat_cmap,
         alpha=alpha,
-        interpolation="gaussian",
+        interpolation="bilinear",
         zorder=6,
     )
+
+    if metric != "density" and len(xs) > 1:
+        points = np.column_stack([xs, ys]).reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        segment_values = 0.5 * (values[:-1] + values[1:])
+
+        colored_route = LineCollection(
+            segments,
+            cmap=heat_cmap,
+            norm=im.norm,
+            linewidth=3.0,
+            alpha=min(1.0, alpha + 0.25),
+            zorder=8,
+        )
+        colored_route.set_array(segment_values)
+        ax.add_collection(colored_route)
 
     # start/end points
     ax.scatter(xs[0], ys[0], s=80, marker="o", color="lime", edgecolor="black", label="Start", zorder=10)
