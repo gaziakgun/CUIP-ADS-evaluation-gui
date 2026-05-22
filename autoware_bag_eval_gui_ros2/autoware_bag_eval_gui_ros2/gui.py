@@ -27,11 +27,13 @@
 import argparse
 import math
 import os
+import sqlite3
 import sys
 import textwrap
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -274,6 +276,95 @@ def safe_getattr(obj, name, default=None):
 
 def sample_times(samples):
     return np.array([s.t for s in samples], dtype=float)
+
+
+def bag_storage_files(bag_path, extension):
+    path = os.path.abspath(bag_path)
+    extension = extension.lower()
+
+    if os.path.isfile(path):
+        return [path] if path.lower().endswith(extension) else []
+
+    if not os.path.isdir(path):
+        return []
+
+    return sorted(
+        os.path.join(path, name)
+        for name in os.listdir(path)
+        if name.lower().endswith(extension)
+    )
+
+
+def bag_metadata_storage_id(bag_path):
+    if not os.path.isdir(bag_path):
+        return None
+
+    metadata_path = os.path.join(bag_path, "metadata.yaml")
+    if not os.path.exists(metadata_path):
+        return None
+
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            for line in metadata_file:
+                stripped = line.strip()
+                if stripped.startswith("storage_identifier:"):
+                    return stripped.split(":", 1)[1].strip().strip("\"'")
+    except OSError:
+        return None
+
+    return None
+
+
+def validate_bag_storage(bag_path, storage_id):
+    if not os.path.exists(bag_path):
+        raise FileNotFoundError(f"Bag path does not exist: {bag_path}")
+
+    storage_id = (storage_id or "").strip()
+    if storage_id not in ("sqlite3", "mcap"):
+        return
+
+    metadata_storage_id = bag_metadata_storage_id(bag_path)
+    if metadata_storage_id and metadata_storage_id != storage_id:
+        raise RuntimeError(
+            f"Selected storage id is '{storage_id}', but this bag metadata uses "
+            f"'{metadata_storage_id}'. Choose '{metadata_storage_id}' in the Bag storage selector."
+        )
+
+    if storage_id == "mcap":
+        mcap_files = bag_storage_files(bag_path, ".mcap")
+        if not mcap_files:
+            raise RuntimeError(
+                f"No .mcap files found in bag path:\n{bag_path}\n\n"
+                "Choose sqlite3 if this is a SQLite ROS 2 bag."
+            )
+        return
+
+    db_files = bag_storage_files(bag_path, ".db3")
+    if not db_files:
+        raise RuntimeError(
+            f"No .db3 files found in bag path:\n{bag_path}\n\n"
+            "Choose mcap if this is an MCAP ROS 2 bag."
+        )
+
+    for db_file in db_files:
+        if not os.access(db_file, os.R_OK):
+            raise RuntimeError(f"SQLite bag database is not readable:\n{db_file}")
+        if os.path.getsize(db_file) == 0:
+            raise RuntimeError(f"SQLite bag database is empty:\n{db_file}")
+
+        connection = None
+        try:
+            connection = sqlite3.connect(Path(db_file).absolute().as_uri() + "?mode=ro", uri=True)
+            connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+        except (sqlite3.Error, OSError) as exc:
+            raise RuntimeError(
+                f"SQLite bag database could not be opened read-only:\n{db_file}\n\n"
+                f"{exc}\n\n"
+                "Check that the bag is on a healthy local disk and that the selected storage id is sqlite3."
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def nearest_time_index(times, t, max_dt=None):
@@ -1774,8 +1865,7 @@ class AutowareBagEvaluator:
         self.topic_types = {}
 
     def read_bag(self):
-        if not os.path.exists(self.bag_path):
-            raise FileNotFoundError(f"Bag path does not exist: {self.bag_path}")
+        validate_bag_storage(self.bag_path, self.storage_id)
 
         storage_options = rosbag2_py.StorageOptions(
             uri=self.bag_path,
@@ -2479,7 +2569,7 @@ class EvaluationGUI(QMainWindow):
         storage_id = self.primary_storage_combo.currentText() if self.primary_storage_combo is not None else self.storage_id
         self.load_primary_bag(self.bag_path, storage_id)
 
-    def on_unit_system_changed(self):
+    def on_unit_system_changed(self, *args):
         if self.units_combo is None:
             return
 
@@ -2487,9 +2577,9 @@ class EvaluationGUI(QMainWindow):
         if unit_system == self.unit_system:
             return
 
+        current_tab_index = self.tabs.currentIndex() if hasattr(self, "tabs") and self.tabs is not None else None
         self.unit_system = unit_system
-        self.reset_view_state_for_rebuild()
-        self.rebuild_ui()
+        self.rebuild_ui(current_tab_index=current_tab_index)
 
     def reset_view_state_for_rebuild(self):
         self.metric_cards = []
@@ -2544,12 +2634,90 @@ class EvaluationGUI(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def rebuild_ui(self):
+    def release_plot_canvas(self, canvas):
+        if canvas is None:
+            return
+
+        selector = getattr(canvas, "span_selector", None)
+        if selector is not None:
+            try:
+                selector.set_active(False)
+            except Exception:
+                pass
+            try:
+                selector.disconnect_events()
+            except Exception:
+                pass
+            canvas.span_selector = None
+
+        for attr_name in (
+            "_scroll_zoom_cid",
+            "_pan_press_cid",
+            "_pan_motion_cid",
+            "_pan_release_cid",
+        ):
+            callback_id = getattr(canvas, attr_name, None)
+            if callback_id is None:
+                continue
+            try:
+                canvas.mpl_disconnect(callback_id)
+            except Exception:
+                pass
+            setattr(canvas, attr_name, None)
+
+        figure = self.figure_for_canvas(canvas)
+        if figure is not None:
+            try:
+                figure.clear()
+            except Exception:
+                pass
+
+        try:
+            canvas.setParent(None)
+        except RuntimeError:
+            pass
+        try:
+            canvas.close()
+        except RuntimeError:
+            pass
+        try:
+            canvas.deleteLater()
+        except RuntimeError:
+            pass
+
+    def release_current_view(self):
         previous_central_widget = self.centralWidget()
+        canvases = list(getattr(self, "plot_canvases", []))
+
+        if previous_central_widget is not None:
+            try:
+                canvases.extend(previous_central_widget.findChildren(FigureCanvas))
+            except TypeError:
+                pass
+
+        seen = set()
+        for canvas in canvases:
+            canvas_id = id(canvas)
+            if canvas_id in seen:
+                continue
+            seen.add(canvas_id)
+            self.release_plot_canvas(canvas)
+
         if previous_central_widget is not None:
             previous_central_widget.setParent(None)
+            previous_central_widget.deleteLater()
+
+        QApplication.processEvents()
+
+    def rebuild_ui(self, current_tab_index=None):
+        self.release_current_view()
+        self.reset_view_state_for_rebuild()
 
         self.setup_ui()
+
+        if current_tab_index is not None and hasattr(self, "tabs") and self.tabs is not None:
+            self.tabs.setCurrentIndex(min(current_tab_index, self.tabs.count() - 1))
+
         self.apply_adaptive_styles(force=True)
 
     def use_us_units(self):
