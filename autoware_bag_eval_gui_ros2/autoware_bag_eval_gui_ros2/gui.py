@@ -55,6 +55,8 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
 from PyQt5.QtCore import Qt
 
@@ -180,6 +182,14 @@ class EvalResults:
     stop_reason_count: int = 0
 
     localization_vs_gnss_errors: list = field(default_factory=list)
+
+
+@dataclass
+class CompareBag:
+    label: str
+    bag_path: str
+    storage_id: str
+    results: EvalResults
 
 
 # ============================================================
@@ -1068,6 +1078,165 @@ def outlier_count(data):
     return int(len(values) - np.count_nonzero(mask))
 
 
+def filtered_values_from_pairs(data, transform=None):
+    if not data:
+        return np.array([])
+
+    values = np.array([p[1] for p in data], dtype=float)
+    if transform is not None:
+        values = transform(values)
+
+    filtered = filter_outliers(values)
+    if len(filtered) == 0:
+        return values[np.isfinite(values)]
+
+    return filtered
+
+
+def mean_or_zero(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.0
+    return float(np.mean(values))
+
+
+def max_or_zero(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.0
+    return float(np.max(values))
+
+
+def rms_or_zero(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(values * values)))
+
+
+def results_time_range(results):
+    times = []
+
+    if results.poses:
+        times.extend([results.poses[0].t, results.poses[-1].t])
+
+    for samples in (
+        results.velocities,
+        results.controls,
+        results.modes,
+        results.trajectories,
+    ):
+        if samples:
+            times.extend([samples[0].t, samples[-1].t])
+
+    for pairs in (
+        results.lateral_errors,
+        results.heading_errors,
+        results.velocity_errors,
+    ):
+        if pairs:
+            times.extend([pairs[0][0], pairs[-1][0]])
+
+    finite_times = [t for t in times if np.isfinite(t)]
+    if not finite_times:
+        return None, None
+
+    return min(finite_times), max(finite_times)
+
+
+def results_time_origin(results):
+    start_t, _ = results_time_range(results)
+    return start_t if start_t is not None else 0.0
+
+
+def summarize_results_for_compare(results):
+    lateral = filtered_values_from_pairs(results.lateral_errors)
+    heading_deg = filtered_values_from_pairs(results.heading_errors, transform=np.degrees)
+    velocity_error = filtered_values_from_pairs(results.velocity_errors)
+    accel_times, accel_values = compute_acceleration_arrays(results.velocities)
+    speed_values = np.array([v.v for v in results.velocities], dtype=float) if results.velocities else np.array([])
+    start_t, end_t = results_time_range(results)
+
+    distance_total = results.distance_total
+    autonomous_distance = results.autonomous_distance
+    auto_dist_pct = 0.0
+    if distance_total > 1e-6:
+        auto_dist_pct = 100.0 * autonomous_distance / distance_total
+
+    total_time = results.total_time
+    if total_time <= 1e-6 and start_t is not None and end_t is not None:
+        total_time = max(0.0, end_t - start_t)
+
+    auto_time_pct = 0.0
+    if total_time > 1e-6:
+        auto_time_pct = 100.0 * results.autonomous_time / total_time
+
+    harsh_brake_count = sum(1 for event in results.brake_events if event.event_type == "HARSH")
+
+    return {
+        "distance_total_m": distance_total,
+        "autonomous_distance_m": autonomous_distance,
+        "autonomous_distance_percent": auto_dist_pct,
+        "total_time_s": total_time,
+        "autonomous_time_percent": auto_time_pct,
+        "takeover_count": results.takeover_count,
+        "mode_change_count": results.mode_change_count,
+        "brake_event_count": len(results.brake_events),
+        "harsh_brake_count": harsh_brake_count,
+        "mean_lateral_error_m": mean_or_zero(lateral),
+        "rms_lateral_error_m": rms_or_zero(lateral),
+        "max_lateral_error_m": max_or_zero(lateral),
+        "mean_abs_heading_error_deg": mean_or_zero(np.abs(heading_deg)),
+        "max_abs_heading_error_deg": max_or_zero(np.abs(heading_deg)),
+        "mean_abs_velocity_error_mps": mean_or_zero(np.abs(velocity_error)),
+        "max_abs_velocity_error_mps": max_or_zero(np.abs(velocity_error)),
+        "mean_speed_mps": mean_or_zero(speed_values),
+        "max_speed_mps": max_or_zero(speed_values),
+        "mean_abs_accel_mps2": mean_or_zero(np.abs(accel_values)),
+        "max_abs_accel_mps2": max_or_zero(np.abs(accel_values)),
+        "lateral_sample_count": len(results.lateral_errors),
+        "velocity_sample_count": len(results.velocity_errors),
+        "accel_sample_count": len(accel_times),
+    }
+
+
+def compare_metric_series(results, metric):
+    origin = results_time_origin(results)
+
+    if metric == "lateral_error":
+        data = filter_sample_pairs(results.lateral_errors)
+        xs = np.array([t - origin for t, _ in data], dtype=float)
+        ys = np.array([v for _, v in data], dtype=float)
+        return xs, ys, "Lateral error [m]", "Lateral Tracking Error"
+
+    if metric == "heading_error":
+        data = filter_sample_pairs(results.heading_errors)
+        xs = np.array([t - origin for t, _ in data], dtype=float)
+        ys = np.array([math.degrees(v) for _, v in data], dtype=float)
+        return xs, ys, "Heading error [deg]", "Heading Error"
+
+    if metric == "velocity_error":
+        data = filter_sample_pairs(results.velocity_errors)
+        xs = np.array([t - origin for t, _ in data], dtype=float)
+        ys = np.array([v for _, v in data], dtype=float)
+        return xs, ys, "Target - actual [m/s]", "Velocity Tracking Error"
+
+    if metric == "vehicle_speed":
+        xs = np.array([v.t - origin for v in results.velocities], dtype=float)
+        ys = np.array([v.v for v in results.velocities], dtype=float)
+        return xs, ys, "Velocity [m/s]", "Actual Vehicle Speed"
+
+    if metric == "acceleration":
+        ts, accel = compute_acceleration_arrays(results.velocities)
+        xs = ts - origin if len(ts) > 0 else np.array([])
+        return xs, accel, "Acceleration [m/s^2]", "Estimated Longitudinal Acceleration"
+
+    raise ValueError(f"Unknown compare metric: {metric}")
+
+
 def sample_grid_values(xs, ys, heat, extent):
     xmin, xmax, ymin, ymax = extent
     bins_x, bins_y = heat.shape
@@ -1553,6 +1722,90 @@ class PlotCanvas(FigureCanvas):
         self.fig.tight_layout()
         self.draw()
 
+    def plot_compare_series(self, series, title, xlabel, ylabel):
+        self.clear_location_axis()
+        self.ax.clear()
+        self.has_time_cursor = False
+        self.time_cursor_line = None
+        self.interval_patch = None
+        plotted = False
+
+        for label, x, y in series:
+            x = np.asarray(x, dtype=float)
+            y = np.asarray(y, dtype=float)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not np.any(finite):
+                continue
+
+            self.ax.plot(x[finite], y[finite], linewidth=1.8, label=label)
+            plotted = True
+
+        self.ax.set_title(title)
+        self.ax.set_xlabel(xlabel)
+        self.ax.set_ylabel(ylabel)
+        self.ax.grid(True, alpha=0.35)
+
+        if plotted:
+            self.ax.legend(loc="best", fontsize=8)
+            self.has_y_scale_controls = True
+            self.apply_robust_y_scale()
+        else:
+            self.ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=self.ax.transAxes)
+            self.has_y_scale_controls = False
+
+        self.fig.tight_layout()
+        self.draw()
+
+    def plot_compare_bars(self, labels, values, title, ylabel):
+        self.clear_location_axis()
+        self.ax.clear()
+        self.has_time_cursor = False
+        self.time_cursor_line = None
+        self.interval_patch = None
+        self.has_y_scale_controls = False
+
+        values = np.asarray(values, dtype=float)
+        if not labels or len(values) == 0:
+            self.ax.set_title(title)
+            self.ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=self.ax.transAxes)
+            self.fig.tight_layout()
+            self.draw()
+            return
+
+        positions = np.arange(len(labels))
+        bars = self.ax.bar(positions, values, color="#1976D2", alpha=0.82)
+        self.ax.set_title(title)
+        self.ax.set_ylabel(ylabel)
+        self.ax.set_xticks(positions)
+        self.ax.set_xticklabels(labels, rotation=20, ha="right")
+        self.ax.grid(True, axis="y", alpha=0.3)
+
+        finite_values = values[np.isfinite(values)]
+        if len(finite_values) > 0:
+            min_value = float(np.min(finite_values))
+            max_value = float(np.max(finite_values))
+            pad = max((max_value - min_value) * 0.12, abs(max_value) * 0.08, 1e-3)
+            bottom = min(0.0, min_value - pad)
+            top = max_value + pad
+            if top <= bottom:
+                top = bottom + 1.0
+            self.ax.set_ylim(bottom, top)
+
+        for bar, value in zip(bars, values):
+            if not np.isfinite(value):
+                continue
+            self.ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{value:.3g}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        self.fig.tight_layout()
+        self.draw()
+
     def clear_location_axis(self):
         if self.location_axis is None:
             return
@@ -1798,14 +2051,30 @@ class PlotCanvas(FigureCanvas):
 
 class EvaluationGUI(QMainWindow):
 
-    def __init__(self, results, bag_path, heatmap_defaults=None):
+    def __init__(self, results, bag_path, storage_id="sqlite3", heatmap_defaults=None):
         super().__init__()
         self.results = results
         self.bag_path = bag_path
+        self.storage_id = storage_id
         self.heatmap_defaults = heatmap_defaults or {}
         self.route_location_mapper = RouteLocationMapper(self.results.poses)
         self.metric_cards = []
         self.metric_card_values = {}
+        self.compare_entries = [
+            CompareBag(
+                label=self.compare_label_for_path(bag_path),
+                bag_path=bag_path,
+                storage_id=storage_id,
+                results=results,
+            )
+        ]
+        self.compare_table = None
+        self.compare_metric_combo = None
+        self.compare_bar_metric_combo = None
+        self.compare_storage_combo = None
+        self.compare_status = None
+        self.compare_series_canvas = None
+        self.compare_bar_canvas = None
         self.analysis_interval = None
         self.analysis_interval_mode = "include"
         self.analysis_interval_status = None
@@ -1852,6 +2121,7 @@ class EvaluationGUI(QMainWindow):
         self.tabs = tabs
 
         tabs.addTab(self.create_summary_tab(), "Summary")
+        tabs.addTab(self.create_compare_tab(), "Compare")
         tabs.addTab(self.create_heatmap_tab(), "OSM Heatmap")
         tabs.addTab(self.create_tracking_tab(), "Tracking")
         tabs.addTab(self.create_velocity_tab(), "Velocity")
@@ -1862,6 +2132,21 @@ class EvaluationGUI(QMainWindow):
 
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
+
+    def compare_label_for_path(self, bag_path):
+        label = os.path.basename(os.path.normpath(bag_path))
+        return label or bag_path
+
+    def unique_compare_label(self, bag_path):
+        base_label = self.compare_label_for_path(bag_path)
+        existing_labels = {entry.label for entry in self.compare_entries}
+        if base_label not in existing_labels:
+            return base_label
+
+        suffix = 2
+        while f"{base_label} ({suffix})" in existing_labels:
+            suffix += 1
+        return f"{base_label} ({suffix})"
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2713,6 +2998,286 @@ class EvaluationGUI(QMainWindow):
 
         widget.setLayout(layout)
         return widget
+
+    def compare_table_columns(self):
+        return [
+            ("Bag", "label", None),
+            ("Storage", "storage_id", None),
+            ("Distance [m]", "distance_total_m", "{:.2f}"),
+            ("Auto Dist [%]", "autonomous_distance_percent", "{:.1f}"),
+            ("Auto Time [%]", "autonomous_time_percent", "{:.1f}"),
+            ("Takeovers", "takeover_count", "{:.0f}"),
+            ("Mode Changes", "mode_change_count", "{:.0f}"),
+            ("Brake Events", "brake_event_count", "{:.0f}"),
+            ("Harsh Brakes", "harsh_brake_count", "{:.0f}"),
+            ("Mean Lat [m]", "mean_lateral_error_m", "{:.3f}"),
+            ("RMS Lat [m]", "rms_lateral_error_m", "{:.3f}"),
+            ("Max Lat [m]", "max_lateral_error_m", "{:.3f}"),
+            ("Mean |Vel Err| [m/s]", "mean_abs_velocity_error_mps", "{:.3f}"),
+            ("Max |Vel Err| [m/s]", "max_abs_velocity_error_mps", "{:.3f}"),
+            ("Mean |Heading| [deg]", "mean_abs_heading_error_deg", "{:.3f}"),
+            ("Max |Heading| [deg]", "max_abs_heading_error_deg", "{:.3f}"),
+            ("Mean Speed [m/s]", "mean_speed_mps", "{:.3f}"),
+            ("Max Speed [m/s]", "max_speed_mps", "{:.3f}"),
+            ("Mean |Accel| [m/s^2]", "mean_abs_accel_mps2", "{:.3f}"),
+            ("Max |Accel| [m/s^2]", "max_abs_accel_mps2", "{:.3f}"),
+            ("Lat Samples", "lateral_sample_count", "{:.0f}"),
+            ("Vel Err Samples", "velocity_sample_count", "{:.0f}"),
+            ("Path", "bag_path", None),
+        ]
+
+    def compare_bar_metrics(self):
+        return [
+            ("RMS lateral error", "rms_lateral_error_m", "RMS lateral error [m]"),
+            ("Mean lateral error", "mean_lateral_error_m", "Mean lateral error [m]"),
+            ("Max lateral error", "max_lateral_error_m", "Max lateral error [m]"),
+            ("Mean abs velocity error", "mean_abs_velocity_error_mps", "Mean |velocity error| [m/s]"),
+            ("Max abs velocity error", "max_abs_velocity_error_mps", "Max |velocity error| [m/s]"),
+            ("Mean abs heading error", "mean_abs_heading_error_deg", "Mean |heading error| [deg]"),
+            ("Distance", "distance_total_m", "Distance [m]"),
+            ("Autonomous distance", "autonomous_distance_percent", "Autonomous distance [%]"),
+            ("Autonomous time", "autonomous_time_percent", "Autonomous time [%]"),
+            ("Takeovers", "takeover_count", "Takeovers"),
+            ("Brake events", "brake_event_count", "Brake events"),
+            ("Harsh brakes", "harsh_brake_count", "Harsh brakes"),
+            ("Mean speed", "mean_speed_mps", "Mean speed [m/s]"),
+            ("Max speed", "max_speed_mps", "Max speed [m/s]"),
+            ("Mean abs acceleration", "mean_abs_accel_mps2", "Mean |acceleration| [m/s^2]"),
+        ]
+
+    def create_compare_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(10)
+        controls.setVerticalSpacing(6)
+
+        self.compare_storage_combo = QComboBox()
+        self.compare_storage_combo.addItems(["sqlite3", "mcap"])
+        storage_index = self.compare_storage_combo.findText(self.storage_id)
+        if storage_index >= 0:
+            self.compare_storage_combo.setCurrentIndex(storage_index)
+
+        add_button = QPushButton("Add Bag")
+        add_button.setToolTip("Add another ROS 2 bag folder to the comparison.")
+        add_button.clicked.connect(self.add_compare_bag_dialog)
+
+        remove_button = QPushButton("Remove Selected")
+        remove_button.setToolTip("Remove selected comparison rows. The opened bag remains as the baseline.")
+        remove_button.clicked.connect(self.remove_selected_compare_bags)
+
+        clear_button = QPushButton("Clear Added Bags")
+        clear_button.setToolTip("Keep only the opened baseline bag.")
+        clear_button.clicked.connect(self.clear_added_compare_bags)
+
+        self.compare_metric_combo = QComboBox()
+        self.compare_metric_combo.addItem("Lateral Error", "lateral_error")
+        self.compare_metric_combo.addItem("Heading Error", "heading_error")
+        self.compare_metric_combo.addItem("Velocity Error", "velocity_error")
+        self.compare_metric_combo.addItem("Vehicle Speed", "vehicle_speed")
+        self.compare_metric_combo.addItem("Longitudinal Acceleration", "acceleration")
+        self.compare_metric_combo.currentIndexChanged.connect(self.update_compare_plots)
+
+        self.compare_bar_metric_combo = QComboBox()
+        for label, key, _ in self.compare_bar_metrics():
+            self.compare_bar_metric_combo.addItem(label, key)
+        self.compare_bar_metric_combo.currentIndexChanged.connect(self.update_compare_bar_plot)
+
+        controls.addWidget(QLabel("Storage ID for added bags"), 0, 0)
+        controls.addWidget(self.compare_storage_combo, 0, 1)
+        controls.addWidget(add_button, 0, 2)
+        controls.addWidget(remove_button, 0, 3)
+        controls.addWidget(clear_button, 0, 4)
+        controls.addWidget(QLabel("Time-series metric"), 1, 0)
+        controls.addWidget(self.compare_metric_combo, 1, 1)
+        controls.addWidget(QLabel("Summary graph metric"), 1, 2)
+        controls.addWidget(self.compare_bar_metric_combo, 1, 3)
+        controls.setColumnStretch(5, 1)
+
+        self.compare_status = QLabel(
+            "Compare: opened bag is the baseline. Add one or more bag folders to compare metrics."
+        )
+        self.compare_status.setWordWrap(True)
+
+        self.compare_table = QTableWidget()
+        self.compare_table.setColumnCount(len(self.compare_table_columns()))
+        self.compare_table.setHorizontalHeaderLabels([column[0] for column in self.compare_table_columns()])
+        self.compare_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.compare_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.compare_table.setAlternatingRowColors(True)
+        self.compare_table.verticalHeader().setVisible(False)
+        self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.compare_table.horizontalHeader().setStretchLastSection(True)
+        self.compare_table.setMinimumHeight(190)
+        self.compare_table.setMaximumHeight(280)
+
+        self.compare_series_canvas = PlotCanvas(width=10, height=4)
+        self.compare_bar_canvas = PlotCanvas(width=10, height=3)
+        self.update_compare_display()
+
+        layout.addLayout(controls)
+        layout.addWidget(self.compare_status)
+        layout.addWidget(self.compare_table)
+        self.add_plot_with_toolbar(layout, self.compare_series_canvas, "Compare Time Series")
+        self.add_plot_with_toolbar(layout, self.compare_bar_canvas, "Compare Summary Metric")
+
+        widget.setLayout(layout)
+        return widget
+
+    def update_compare_display(self):
+        self.update_compare_table()
+        self.update_compare_plots()
+        self.update_compare_bar_plot()
+
+        if self.compare_status is not None:
+            count = len(self.compare_entries)
+            if count == 1:
+                self.compare_status.setText(
+                    "Compare: opened bag is the baseline. Add one or more bag folders to compare metrics."
+                )
+            else:
+                self.compare_status.setText(f"Compare: {count} bags loaded.")
+
+    def update_compare_table(self):
+        if self.compare_table is None:
+            return
+
+        columns = self.compare_table_columns()
+        self.compare_table.setRowCount(len(self.compare_entries))
+
+        for row, entry in enumerate(self.compare_entries):
+            stats = summarize_results_for_compare(entry.results)
+
+            for col, (_, key, fmt) in enumerate(columns):
+                if key == "label":
+                    text = entry.label
+                elif key == "bag_path":
+                    text = entry.bag_path
+                elif key == "storage_id":
+                    text = entry.storage_id
+                else:
+                    value = stats.get(key, 0.0)
+                    text = fmt.format(value) if fmt is not None else str(value)
+
+                item = QTableWidgetItem(text)
+                if key not in ("label", "bag_path", "storage_id"):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.compare_table.setItem(row, col, item)
+
+        self.compare_table.resizeColumnsToContents()
+
+    def update_compare_plots(self, *args):
+        if self.compare_series_canvas is None or self.compare_metric_combo is None:
+            return
+
+        metric = self.compare_metric_combo.currentData() or "lateral_error"
+        series = []
+        title = "Comparison"
+        ylabel = ""
+
+        for entry in self.compare_entries:
+            xs, ys, ylabel, title = compare_metric_series(entry.results, metric)
+            series.append((entry.label, xs, ys))
+
+        self.compare_series_canvas.plot_compare_series(
+            series,
+            title=f"{title} Comparison",
+            xlabel="Time from bag start [s]",
+            ylabel=ylabel,
+        )
+
+    def update_compare_bar_plot(self, *args):
+        if self.compare_bar_canvas is None or self.compare_bar_metric_combo is None:
+            return
+
+        metric = self.compare_bar_metric_combo.currentData() or "rms_lateral_error_m"
+        metric_defs = {key: (label, ylabel) for label, key, ylabel in self.compare_bar_metrics()}
+        title, ylabel = metric_defs.get(metric, ("Summary Metric", metric))
+
+        labels = []
+        values = []
+        for entry in self.compare_entries:
+            stats = summarize_results_for_compare(entry.results)
+            labels.append(entry.label)
+            values.append(stats.get(metric, 0.0))
+
+        self.compare_bar_canvas.plot_compare_bars(
+            labels,
+            values,
+            title=f"{title} by Bag",
+            ylabel=ylabel,
+        )
+
+    def add_compare_bag_dialog(self):
+        bag_path = QFileDialog.getExistingDirectory(self, "Select ROS 2 bag folder")
+        if not bag_path:
+            return
+
+        storage_id = self.compare_storage_combo.currentText() if self.compare_storage_combo is not None else self.storage_id
+        self.add_compare_bag(bag_path, storage_id)
+
+    def add_compare_bag(self, bag_path, storage_id):
+        normalized_path = os.path.abspath(bag_path)
+        for entry in self.compare_entries:
+            if os.path.abspath(entry.bag_path) == normalized_path and entry.storage_id == storage_id:
+                QMessageBox.information(self, "Compare Bag", "That bag is already loaded for comparison.")
+                return
+
+        if self.compare_status is not None:
+            self.compare_status.setText(f"Reading comparison bag: {normalized_path}")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+
+        try:
+            evaluator = AutowareBagEvaluator(normalized_path, storage_id)
+            evaluator.read_bag()
+            self.compare_entries.append(
+                CompareBag(
+                    label=self.unique_compare_label(normalized_path),
+                    bag_path=normalized_path,
+                    storage_id=storage_id,
+                    results=evaluator.results,
+                )
+            )
+            self.update_compare_display()
+
+        except Exception as exc:
+            if self.compare_status is not None:
+                self.compare_status.setText(f"Compare failed: {exc}")
+            QMessageBox.warning(self, "Compare Bag Error", str(exc))
+
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def remove_selected_compare_bags(self):
+        if self.compare_table is None:
+            return
+
+        rows = sorted({index.row() for index in self.compare_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            current_row = self.compare_table.currentRow()
+            rows = [current_row] if current_row >= 0 else []
+
+        removable_rows = [row for row in rows if row > 0 and row < len(self.compare_entries)]
+        if not removable_rows:
+            if self.compare_status is not None:
+                self.compare_status.setText("The opened baseline bag stays pinned; select added bags to remove.")
+            return
+
+        for row in removable_rows:
+            del self.compare_entries[row]
+
+        self.update_compare_display()
+
+    def clear_added_compare_bags(self):
+        if len(self.compare_entries) <= 1:
+            return
+
+        self.compare_entries = self.compare_entries[:1]
+        self.update_compare_display()
 
     def create_route_tab(self):
         widget = QWidget()
@@ -3616,7 +4181,12 @@ def main():
         "alpha": args.heatmap_alpha,
         "cmap": args.heatmap_cmap,
     }
-    gui = EvaluationGUI(evaluator.results, args.bag, heatmap_defaults=heatmap_defaults)
+    gui = EvaluationGUI(
+        evaluator.results,
+        args.bag,
+        storage_id=args.storage_id,
+        heatmap_defaults=heatmap_defaults,
+    )
     gui.show()
     sys.exit(app.exec_())
 
