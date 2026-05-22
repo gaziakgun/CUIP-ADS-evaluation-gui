@@ -64,6 +64,8 @@ TOPICS=(
   "/raptor_dbw_interface/accelerator_pedal_cmd"
   "/raptor_dbw_interface/steering_cmd"
   "/raptor_dbw_interface/dbw_enabled"
+  "/raptor_dbw_interface/brake_report"
+  "/raptor_dbw_interface/brake_2_report"
 )
 
 # ------------------------------------------------------------

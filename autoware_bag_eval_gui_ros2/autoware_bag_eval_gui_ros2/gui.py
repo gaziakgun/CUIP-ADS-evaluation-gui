@@ -59,6 +59,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QTextEdit,
     QTabWidget,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -124,6 +125,15 @@ M_TO_MI = 0.000621371192237334
 MPS_TO_MPH = 2.2369362920544
 KM_PER_MILE = 1.609344
 
+BRAKE_ACCEL_START_THRESHOLD = -0.5
+BRAKE_ACCEL_END_THRESHOLD = -0.2
+BRAKE_MIN_EVENT_DURATION_S = 0.2
+BRAKE_MIN_SPEED_MPS = 1.0
+HARSH_DECEL_THRESHOLD_MPS2 = 3.0
+HARSH_JERK_THRESHOLD_MPS3 = 5.0
+HARSH_SPEED_DROP_THRESHOLD_MPS = 2.5
+HARSH_SPEED_DROP_WINDOW_S = 1.5
+
 
 # ============================================================
 # Data containers
@@ -178,6 +188,13 @@ class BrakeEvent:
     peak_signal: float = math.nan
     signal_name: str = ""
     signal_unit: str = ""
+    peak_decel: float = math.nan
+    avg_decel: float = math.nan
+    initial_speed: float = math.nan
+    final_speed: float = math.nan
+    speed_drop: float = math.nan
+    distance_m: float = math.nan
+    harsh_reasons: str = ""
 
 
 @dataclass
@@ -224,6 +241,9 @@ class EvalResults:
     brake_reports: list = field(default_factory=list)
     brake_pressure_reports: list = field(default_factory=list)
     harsh_brake_count: int = 0
+    topic_types: dict = field(default_factory=dict)
+    selected_topics: list = field(default_factory=list)
+    topic_load_errors: dict = field(default_factory=dict)
 
     stop_reason_count: int = 0
 
@@ -977,7 +997,169 @@ def compute_mode_stats_for_interval(modes, start_t, end_t):
     return mode_change_count, takeover_count, autonomous_time, end_t - start_t
 
 
-def compute_brake_events(velocities, accel_threshold=-0.5, harsh_threshold=-3.0):
+def velocity_time_value_arrays(velocities):
+    if not velocities:
+        return np.array([]), np.array([])
+
+    times = np.array([sample.t for sample in velocities], dtype=float)
+    values = np.array([sample.v for sample in velocities], dtype=float)
+    finite = np.isfinite(times) & np.isfinite(values)
+    if not np.any(finite):
+        return np.array([]), np.array([])
+
+    times = times[finite]
+    values = values[finite]
+    order = np.argsort(times)
+    return times[order], values[order]
+
+
+def interpolated_value(times, values, t):
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if len(times) == 0 or not np.isfinite(t):
+        return math.nan
+
+    if len(times) == 1:
+        return float(values[0])
+
+    return float(np.interp(float(t), times, values))
+
+
+def integrate_speed_between(times, speeds, start_t, end_t):
+    if end_t <= start_t:
+        return 0.0
+    if len(times) == 0:
+        return math.nan
+
+    inside = (times > start_t) & (times < end_t)
+    event_times = np.concatenate(([start_t], times[inside], [end_t]))
+    event_speeds = np.interp(event_times, times, speeds)
+    event_speeds = np.maximum(event_speeds, 0.0)
+
+    return float(np.trapz(event_speeds, event_times))
+
+
+def compute_jerk_arrays(velocities):
+    accel_times, accel_values = compute_acceleration_arrays(velocities)
+    if len(accel_values) < 2:
+        return np.array([]), np.array([])
+
+    dt = np.diff(accel_times)
+    da = np.diff(accel_values)
+    valid = dt > 1e-3
+    jerk = np.zeros_like(da)
+    jerk[valid] = da[valid] / dt[valid]
+    return accel_times[1:], jerk
+
+
+def classify_brake_event(event, fallback_harsh=False):
+    duration = event.end_t - event.start_t
+    reasons = []
+
+    low_speed_event = (
+        np.isfinite(event.initial_speed)
+        and event.initial_speed < BRAKE_MIN_SPEED_MPS
+        and (not np.isfinite(event.speed_drop) or event.speed_drop < 0.5)
+    )
+
+    if duration >= BRAKE_MIN_EVENT_DURATION_S and not low_speed_event:
+        if np.isfinite(event.peak_decel) and event.peak_decel >= HARSH_DECEL_THRESHOLD_MPS2:
+            reasons.append(f"peak decel >= {HARSH_DECEL_THRESHOLD_MPS2:.1f} m/s^2")
+        if np.isfinite(event.max_jerk) and event.max_jerk >= HARSH_JERK_THRESHOLD_MPS3:
+            reasons.append(f"jerk >= {HARSH_JERK_THRESHOLD_MPS3:.1f} m/s^3")
+        if (
+            np.isfinite(event.speed_drop)
+            and event.speed_drop >= HARSH_SPEED_DROP_THRESHOLD_MPS
+            and duration <= HARSH_SPEED_DROP_WINDOW_S
+        ):
+            reasons.append(
+                f"speed drop >= {HARSH_SPEED_DROP_THRESHOLD_MPS:.1f} m/s in "
+                f"{HARSH_SPEED_DROP_WINDOW_S:.1f}s"
+            )
+
+    has_motion_context = any(
+        np.isfinite(value)
+        for value in (
+            event.peak_decel,
+            event.avg_decel,
+            event.max_jerk,
+            event.initial_speed,
+            event.final_speed,
+            event.speed_drop,
+        )
+    )
+
+    if reasons:
+        event.event_type = "HARSH"
+        event.harsh_reasons = "; ".join(reasons)
+    elif fallback_harsh and not has_motion_context:
+        event.event_type = "HARSH"
+        event.harsh_reasons = "brake signal threshold"
+    else:
+        event.event_type = "NORMAL"
+        if duration < BRAKE_MIN_EVENT_DURATION_S:
+            event.harsh_reasons = "short event"
+        elif low_speed_event:
+            event.harsh_reasons = "low-speed braking"
+        else:
+            event.harsh_reasons = "below harsh thresholds"
+
+
+def enrich_brake_event_with_motion(event, velocities):
+    fallback_harsh = event.event_type == "HARSH"
+    times, speeds = velocity_time_value_arrays(velocities)
+
+    if len(times) > 0:
+        event.initial_speed = interpolated_value(times, speeds, event.start_t)
+        event.final_speed = interpolated_value(times, speeds, event.end_t)
+        if np.isfinite(event.initial_speed) and np.isfinite(event.final_speed):
+            event.speed_drop = max(0.0, event.initial_speed - event.final_speed)
+
+        event.distance_m = integrate_speed_between(times, speeds, event.start_t, event.end_t)
+
+    duration = event.end_t - event.start_t
+    if duration > 1e-6 and np.isfinite(event.speed_drop):
+        event.avg_decel = event.speed_drop / duration
+
+    accel_times, accel_values = compute_acceleration_arrays(velocities)
+    if len(accel_times) > 0:
+        in_event = (accel_times >= event.start_t) & (accel_times <= event.end_t)
+        event_accel = accel_values[in_event]
+        event_accel = event_accel[np.isfinite(event_accel)]
+
+        if len(event_accel) > 0:
+            event.min_accel = float(np.min(event_accel))
+            event.peak_decel = max(0.0, -event.min_accel)
+            if not np.isfinite(event.avg_decel):
+                event.avg_decel = max(0.0, -float(np.mean(event_accel)))
+
+    if not np.isfinite(event.peak_decel) and np.isfinite(event.min_accel):
+        event.peak_decel = max(0.0, -event.min_accel)
+    if not np.isfinite(event.min_accel) and np.isfinite(event.avg_decel):
+        event.min_accel = -event.avg_decel
+        event.peak_decel = event.avg_decel
+
+    jerk_times, jerk_values = compute_jerk_arrays(velocities)
+    if len(jerk_times) > 0:
+        in_event = (jerk_times >= event.start_t) & (jerk_times <= event.end_t)
+        event_jerk = jerk_values[in_event]
+        event_jerk = event_jerk[np.isfinite(event_jerk)]
+        if len(event_jerk) > 0:
+            event.max_jerk = float(np.max(np.abs(event_jerk)))
+
+    classify_brake_event(event, fallback_harsh=fallback_harsh)
+    return event
+
+
+def enrich_brake_events_with_motion(events, velocities):
+    return [enrich_brake_event_with_motion(event, velocities) for event in events]
+
+
+def compute_brake_events(
+    velocities,
+    accel_threshold=BRAKE_ACCEL_START_THRESHOLD,
+    harsh_threshold=-HARSH_DECEL_THRESHOLD_MPS2,
+):
     """
     Brake event detection from velocity derivative.
     """
@@ -1011,7 +1193,7 @@ def compute_brake_events(velocities, accel_threshold=-0.5, harsh_threshold=-3.0)
             in_event = True
             start_idx = i
 
-        if in_event and (a >= -0.2 or i == len(accel) - 1):
+        if in_event and (a >= BRAKE_ACCEL_END_THRESHOLD or i == len(accel) - 1):
             end_idx = i
             event_accel = accel[start_idx:end_idx + 1]
             event_jerk = jerk[start_idx:end_idx + 1]
@@ -1019,20 +1201,37 @@ def compute_brake_events(velocities, accel_threshold=-0.5, harsh_threshold=-3.0)
             if len(event_accel) > 0:
                 min_accel = float(np.min(event_accel))
                 max_jerk = float(np.max(np.abs(event_jerk)))
+                end_time_idx = min(end_idx + 1, len(ts) - 1)
+                start_t = float(ts[start_idx])
+                end_t = float(ts[end_time_idx])
+                duration = end_t - start_t
+
+                if duration < BRAKE_MIN_EVENT_DURATION_S:
+                    in_event = False
+                    continue
+
+                initial_speed = float(vs[start_idx])
+                if initial_speed < BRAKE_MIN_SPEED_MPS:
+                    in_event = False
+                    continue
 
                 event_type = "HARSH" if min_accel < harsh_threshold else "NORMAL"
 
+                event = BrakeEvent(
+                    start_t=start_t,
+                    end_t=end_t,
+                    min_accel=min_accel,
+                    max_jerk=max_jerk,
+                    event_type=event_type,
+                    source="velocity_deceleration",
+                    peak_signal=max(0.0, -min_accel),
+                    signal_name="deceleration",
+                    signal_unit="m/s^2",
+                )
                 events.append(
-                    BrakeEvent(
-                        start_t=float(ts[start_idx]),
-                        end_t=float(ts[end_idx]),
-                        min_accel=min_accel,
-                        max_jerk=max_jerk,
-                        event_type=event_type,
-                        source="velocity_deceleration",
-                        peak_signal=max(0.0, -min_accel),
-                        signal_name="deceleration",
-                        signal_unit="m/s^2",
+                    enrich_brake_event_with_motion(
+                        event,
+                        velocities,
                     )
                 )
 
@@ -1049,6 +1248,7 @@ def compute_brake_signal_events(
     signal_unit="",
     activation_threshold=None,
     harsh_threshold=None,
+    min_event_duration=BRAKE_MIN_EVENT_DURATION_S,
 ):
     times = np.asarray(times, dtype=float)
     values = np.asarray(values, dtype=float)
@@ -1087,13 +1287,16 @@ def compute_brake_signal_events(
         if in_event and (not active or i == len(values) - 1):
             end_idx = i if active else max(start_idx, i - 1)
             event_values = values[start_idx:end_idx + 1]
+            start_t = float(times[start_idx])
+            end_t = float(times[end_idx])
+            duration = end_t - start_t
 
-            if len(event_values) > 0:
+            if len(event_values) > 0 and duration >= min_event_duration:
                 event_peak = float(np.max(event_values))
                 events.append(
                     BrakeEvent(
-                        start_t=float(times[start_idx]),
-                        end_t=float(times[end_idx]),
+                        start_t=start_t,
+                        end_t=end_t,
                         min_accel=math.nan,
                         max_jerk=math.nan,
                         event_type="HARSH" if event_peak >= harsh_threshold else "NORMAL",
@@ -1137,12 +1340,20 @@ def brake_report_signal_arrays(brake_reports):
 
 def brake_heatmap_signal_arrays(velocities, brake_reports=None, brake_pressure_reports=None):
     pressure_times, pressure_values = brake_pressure_arrays(brake_pressure_reports)
-    if len(pressure_times) > 0:
+    pressure_has_signal = (
+        len(pressure_times) > 0
+        and np.any(np.isfinite(pressure_values))
+        and float(np.nanmax(np.maximum(pressure_values, 0.0))) > 1e-6
+    )
+    if pressure_has_signal:
         return pressure_times, pressure_values, "brake pressure", ""
 
     report_times, report_values, signal_name, signal_unit = brake_report_signal_arrays(brake_reports)
     if len(report_times) > 0:
         return report_times, report_values, signal_name, signal_unit
+
+    if len(pressure_times) > 0:
+        return pressure_times, pressure_values, "brake pressure", ""
 
     accel_times, accel_values = compute_acceleration_arrays(velocities)
     if len(accel_times) == 0:
@@ -1151,25 +1362,31 @@ def brake_heatmap_signal_arrays(velocities, brake_reports=None, brake_pressure_r
     return accel_times, np.maximum(0.0, -accel_values), "deceleration", "m/s^2"
 
 
-def compute_direct_brake_events(brake_reports=None, brake_pressure_reports=None):
+def compute_direct_brake_events(brake_reports=None, brake_pressure_reports=None, velocities=None):
+    velocities = velocities or []
     pressure_times, pressure_values = brake_pressure_arrays(brake_pressure_reports)
     if len(pressure_times) > 0:
-        return compute_brake_signal_events(
+        pressure_events = compute_brake_signal_events(
             pressure_times,
             pressure_values,
             source=TOPIC_BRAKE_2_REPORT,
             signal_name="brake pressure",
         )
+        if pressure_events:
+            return enrich_brake_events_with_motion(pressure_events, velocities)
 
     report_times, report_values, signal_name, signal_unit = brake_report_signal_arrays(brake_reports)
     if len(report_times) > 0:
-        return compute_brake_signal_events(
+        activation_threshold = 5.0 if signal_unit == "%" else None
+        report_events = compute_brake_signal_events(
             report_times,
             report_values,
             source=TOPIC_BRAKE_REPORT,
             signal_name=signal_name,
             signal_unit=signal_unit,
+            activation_threshold=activation_threshold,
         )
+        return enrich_brake_events_with_motion(report_events, velocities)
 
     return []
 
@@ -1412,6 +1629,14 @@ def max_or_zero(values):
     return float(np.max(values))
 
 
+def percentile_or_zero(values, percentile):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.0
+    return float(np.percentile(values, percentile))
+
+
 def rms_or_zero(values):
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
@@ -1457,6 +1682,44 @@ def results_time_origin(results):
     return start_t if start_t is not None else 0.0
 
 
+def brake_event_stats(brake_events, distance_total_m=0.0, total_time_s=0.0):
+    durations = np.array([event.end_t - event.start_t for event in brake_events], dtype=float)
+    peak_decels = np.array([event.peak_decel for event in brake_events], dtype=float)
+    avg_decels = np.array([event.avg_decel for event in brake_events], dtype=float)
+    max_jerks = np.array([event.max_jerk for event in brake_events], dtype=float)
+    speed_drops = np.array([event.speed_drop for event in brake_events], dtype=float)
+    distances = np.array([event.distance_m for event in brake_events], dtype=float)
+
+    harsh_count = sum(1 for event in brake_events if event.event_type == "HARSH")
+    brake_time_s = float(np.sum(durations[np.isfinite(durations)])) if len(durations) > 0 else 0.0
+    brake_time_pct = 0.0
+    if total_time_s > 1e-6:
+        brake_time_pct = 100.0 * brake_time_s / total_time_s
+
+    distance_km = distance_total_m / 1000.0 if distance_total_m > 1e-6 else 0.0
+    brake_events_per_km = len(brake_events) / distance_km if distance_km > 1e-9 else 0.0
+    harsh_per_km = harsh_count / distance_km if distance_km > 1e-9 else 0.0
+
+    return {
+        "brake_event_count": len(brake_events),
+        "harsh_brake_count": harsh_count,
+        "brake_events_per_km": brake_events_per_km,
+        "harsh_per_km": harsh_per_km,
+        "brake_time_s": brake_time_s,
+        "brake_time_pct": brake_time_pct,
+        "avg_brake_duration_s": mean_or_zero(durations),
+        "max_brake_duration_s": max_or_zero(durations),
+        "mean_brake_decel_mps2": mean_or_zero(avg_decels),
+        "max_brake_decel_mps2": max_or_zero(peak_decels),
+        "p95_brake_decel_mps2": percentile_or_zero(peak_decels, 95.0),
+        "max_brake_jerk_mps3": max_or_zero(max_jerks),
+        "p95_brake_jerk_mps3": percentile_or_zero(max_jerks, 95.0),
+        "mean_speed_drop_mps": mean_or_zero(speed_drops),
+        "max_speed_drop_mps": max_or_zero(speed_drops),
+        "total_brake_distance_m": float(np.sum(distances[np.isfinite(distances)])) if len(distances) > 0 else 0.0,
+    }
+
+
 def summarize_results_for_compare(results):
     lateral = filtered_values_from_pairs(results.lateral_errors)
     heading_deg = filtered_values_from_pairs(results.heading_errors, transform=np.degrees)
@@ -1479,9 +1742,9 @@ def summarize_results_for_compare(results):
     if total_time > 1e-6:
         auto_time_pct = 100.0 * results.autonomous_time / total_time
 
-    harsh_brake_count = sum(1 for event in results.brake_events if event.event_type == "HARSH")
+    brake_stats = brake_event_stats(results.brake_events, distance_total, total_time)
 
-    return {
+    stats = {
         "distance_total_m": distance_total,
         "autonomous_distance_m": autonomous_distance,
         "autonomous_distance_percent": auto_dist_pct,
@@ -1489,8 +1752,6 @@ def summarize_results_for_compare(results):
         "autonomous_time_percent": auto_time_pct,
         "takeover_count": results.takeover_count,
         "mode_change_count": results.mode_change_count,
-        "brake_event_count": len(results.brake_events),
-        "harsh_brake_count": harsh_brake_count,
         "mean_lateral_error_m": mean_or_zero(lateral),
         "rms_lateral_error_m": rms_or_zero(lateral),
         "max_lateral_error_m": max_or_zero(lateral),
@@ -1506,6 +1767,8 @@ def summarize_results_for_compare(results):
         "velocity_sample_count": len(results.velocity_errors),
         "accel_sample_count": len(accel_times),
     }
+    stats.update(brake_stats)
+    return stats
 
 
 def compare_metric_series(results, metric):
@@ -1882,12 +2145,14 @@ class AutowareBagEvaluator:
 
         topic_types = reader.get_all_topics_and_types()
         self.topic_types = {t.name: t.type for t in topic_types}
+        self.results.topic_types = dict(self.topic_types)
 
         print("Available topics in bag:")
         for topic, typ in self.topic_types.items():
             print(f"  {topic}: {typ}")
 
         selected_topics = sorted(set(self.topic_types).intersection(EVALUATION_TOPICS))
+        self.results.selected_topics = list(selected_topics)
         if selected_topics:
             print("Reading evaluation topics only:")
             for topic in selected_topics:
@@ -1904,6 +2169,7 @@ class AutowareBagEvaluator:
             try:
                 msg_types[topic] = get_message(type_name)
             except Exception as e:
+                self.results.topic_load_errors[topic] = f"{type_name}: {e}"
                 print(f"Could not load message type for {topic}: {type_name}. Error: {e}")
 
         while reader.has_next():
@@ -1915,7 +2181,8 @@ class AutowareBagEvaluator:
 
             try:
                 msg = deserialize_message(data, msg_types[topic])
-            except Exception:
+            except Exception as e:
+                self.results.topic_load_errors.setdefault(topic, f"Deserialize error: {e}")
                 continue
 
             if topic == TOPIC_LOCALIZATION:
@@ -1980,6 +2247,7 @@ class AutowareBagEvaluator:
         r.brake_events = compute_direct_brake_events(
             r.brake_reports,
             r.brake_pressure_reports,
+            r.velocities,
         )
         if not r.brake_events:
             r.brake_events = compute_brake_events(r.velocities)
@@ -2062,15 +2330,37 @@ class PlotCanvas(FigureCanvas):
         self.has_time_cursor = False
         self.time_cursor_line = None
         self.interval_patch = None
-        self.ax.plot(x, y, linewidth=2)
+
+        x_values = np.asarray(x, dtype=float)
+        y_values = np.asarray(y, dtype=float)
+        finite = (
+            len(x_values) == len(y_values)
+            and len(x_values) > 0
+            and np.isfinite(x_values)
+            & np.isfinite(y_values)
+        )
+
+        if np.any(finite):
+            self.ax.plot(x_values, y_values, linewidth=2)
+        else:
+            self.ax.text(
+                0.5,
+                0.5,
+                "No data available",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+            )
+
         self.ax.set_title(title)
         self.ax.set_xlabel(xlabel)
         self.ax.set_ylabel(ylabel)
         self.ax.grid(True)
         self.add_location_axis(location_mapper, time_origin, location_unit_label, location_scale)
-        self.has_y_scale_controls = True
-        self.apply_robust_y_scale()
-        self.configure_time_cursor(x, time_origin)
+        self.has_y_scale_controls = bool(np.any(finite))
+        if self.has_y_scale_controls:
+            self.apply_robust_y_scale()
+        self.configure_time_cursor(x_values, time_origin)
         self.fig.tight_layout()
         self.draw()
 
@@ -2460,6 +2750,8 @@ class EvaluationGUI(QMainWindow):
         self.heatmap_marker_label = None
         self.heatmap_time_scroll = None
         self.heatmap_time_label = None
+        self.braking_time_scroll = None
+        self.braking_time_label = None
         self.heatmap_save_button = None
         self.heatmap_status = None
         self.time_cursor_status = None
@@ -2608,6 +2900,8 @@ class EvaluationGUI(QMainWindow):
         self.heatmap_marker_label = None
         self.heatmap_time_scroll = None
         self.heatmap_time_label = None
+        self.braking_time_scroll = None
+        self.braking_time_label = None
         self.heatmap_save_button = None
         self.heatmap_status = None
         self.time_cursor_status = None
@@ -2764,6 +3058,12 @@ class EvaluationGUI(QMainWindow):
             return values * M_TO_FT
         return values
 
+    def convert_jerk(self, value_mps3):
+        values = np.asarray(value_mps3, dtype=float)
+        if self.use_us_units():
+            return values * M_TO_FT
+        return values
+
     def format_length(self, value_m, long_distance=False):
         value = float(self.convert_length(value_m, long_distance=long_distance))
         if long_distance:
@@ -2775,6 +3075,9 @@ class EvaluationGUI(QMainWindow):
 
     def format_accel(self, value_mps2):
         return f"{float(self.convert_accel(value_mps2)):.2f}"
+
+    def format_jerk(self, value_mps3):
+        return f"{float(self.convert_jerk(value_mps3)):.2f}"
 
     def rate_per_display_distance(self, count, distance_m):
         if distance_m <= 1e-6:
@@ -2800,10 +3103,22 @@ class EvaluationGUI(QMainWindow):
             "max_abs_velocity_error_mps",
             "mean_speed_mps",
             "max_speed_mps",
+            "mean_speed_drop_mps",
+            "max_speed_drop_mps",
         ):
             return float(self.convert_speed(value))
-        if key in ("mean_abs_accel_mps2", "max_abs_accel_mps2"):
+        if key in (
+            "mean_abs_accel_mps2",
+            "max_abs_accel_mps2",
+            "mean_brake_decel_mps2",
+            "max_brake_decel_mps2",
+            "p95_brake_decel_mps2",
+        ):
             return float(self.convert_accel(value))
+        if key in ("max_brake_jerk_mps3", "p95_brake_jerk_mps3"):
+            return float(self.convert_jerk(value))
+        if key in ("brake_events_per_km", "harsh_per_km") and self.use_us_units():
+            return float(value) * KM_PER_MILE
         return value
 
     def convert_series_values(self, metric, values):
@@ -2844,11 +3159,12 @@ class EvaluationGUI(QMainWindow):
         }
 
     def brake_event_source_text(self):
+        suffix = "; harsh classification uses decel/jerk/speed-drop"
         if self.results.brake_pressure_reports:
-            return f"{TOPIC_BRAKE_2_REPORT} brake_pressure"
+            return f"{TOPIC_BRAKE_2_REPORT} brake_pressure{suffix}"
         if self.results.brake_reports:
             _, _, signal_name, _ = brake_report_signal_arrays(self.results.brake_reports)
-            return f"{TOPIC_BRAKE_REPORT} {signal_name}"
+            return f"{TOPIC_BRAKE_REPORT} {signal_name}{suffix}"
         return "velocity-derived deceleration"
 
     def resizeEvent(self, event):
@@ -3288,15 +3604,22 @@ class EvaluationGUI(QMainWindow):
 
         self._syncing_time_scrolls = True
         try:
-            if self.heatmap_time_scroll is not None and self.heatmap_time_label is not None:
+            route_scroll_controls = [
+                (self.heatmap_time_scroll, self.heatmap_time_label),
+                (self.braking_time_scroll, self.braking_time_label),
+            ]
+            for route_scroll, route_label in route_scroll_controls:
+                if route_scroll is None or route_label is None:
+                    continue
+
                 if self.selected_time is None:
-                    self.heatmap_time_label.setText("Time --")
+                    route_label.setText("Time --")
                 else:
-                    self.heatmap_time_scroll.setValue(
+                    route_scroll.setValue(
                         self.route_scroll_value_from_time(self.selected_time)
                     )
                     route_t = self.selected_time - self.route_time_origin()
-                    self.heatmap_time_label.setText(f"{route_t:.2f} s")
+                    route_label.setText(f"{route_t:.2f} s")
 
             for entry in self.time_scroll_controls:
                 canvas = entry["canvas"]
@@ -3546,6 +3869,10 @@ class EvaluationGUI(QMainWindow):
             takeover_count = r.takeover_count
             autonomous_time = r.autonomous_time
             total_time = r.total_time
+            if total_time <= 1e-6:
+                start_t, end_t = self.route_time_range()
+                if start_t is not None and end_t is not None:
+                    total_time = max(0.0, end_t - start_t)
         elif self.analysis_interval_mode == "exclude":
             start_t, end_t = self.analysis_interval
             poses = self.samples_in_interval(r.poses)
@@ -3576,7 +3903,7 @@ class EvaluationGUI(QMainWindow):
             ) = compute_mode_stats_for_interval(r.modes, start_t, end_t)
 
         brake_events = self.brake_events_in_interval()
-        harsh_brake_count = sum(1 for event in brake_events if event.event_type == "HARSH")
+        brake_stats = brake_event_stats(brake_events, distance_total, total_time)
 
         lateral_errors = self.time_pairs_in_interval(r.lateral_errors)
         velocity_errors = self.time_pairs_in_interval(r.velocity_errors)
@@ -3593,11 +3920,7 @@ class EvaluationGUI(QMainWindow):
         if distance_total > 1e-6:
             takeover_per_km = takeover_count / (distance_total / 1000.0)
 
-        harsh_per_km = 0.0
-        if distance_total > 1e-6:
-            harsh_per_km = harsh_brake_count / (distance_total / 1000.0)
-
-        return {
+        stats = {
             "distance_total": distance_total,
             "autonomous_distance": autonomous_distance,
             "auto_dist_pct": auto_dist_pct,
@@ -3608,9 +3931,6 @@ class EvaluationGUI(QMainWindow):
             "takeover_count": takeover_count,
             "takeover_per_km": takeover_per_km,
             "brake_events": brake_events,
-            "brake_event_count": len(brake_events),
-            "harsh_brake_count": harsh_brake_count,
-            "harsh_per_km": harsh_per_km,
             "mean_lat": self.mean_value(lateral_errors),
             "rms_lat": self.rms_value(lateral_errors),
             "max_lat": self.max_value(lateral_errors),
@@ -3621,6 +3941,8 @@ class EvaluationGUI(QMainWindow):
             "lateral_sample_count": len(lateral_errors),
             "velocity_sample_count": len(velocity_errors),
         }
+        stats.update(brake_stats)
+        return stats
 
     def update_summary_display(self):
         if not self.metric_card_values:
@@ -3635,6 +3957,10 @@ class EvaluationGUI(QMainWindow):
         self.set_metric_card_value("mode_change_count", f"{stats['mode_change_count']}")
         self.set_metric_card_value("brake_event_count", f"{stats['brake_event_count']}")
         self.set_metric_card_value("harsh_brake_count", f"{stats['harsh_brake_count']}")
+        self.set_metric_card_value("brake_time_pct", f"{stats['brake_time_pct']:.1f}")
+        self.set_metric_card_value("max_brake_decel", self.format_accel(stats["max_brake_decel_mps2"]))
+        self.set_metric_card_value("max_brake_jerk", self.format_jerk(stats["max_brake_jerk_mps3"]))
+        self.set_metric_card_value("max_speed_drop", self.format_speed(stats["max_speed_drop_mps"]))
         self.set_metric_card_value("mean_lat", self.format_length(stats["mean_lat"]))
         self.set_metric_card_value("rms_lat", self.format_length(stats["rms_lat"]))
         self.set_metric_card_value("max_lat", self.format_length(stats["max_lat"]))
@@ -3657,6 +3983,8 @@ class EvaluationGUI(QMainWindow):
         long_distance_unit = self.length_unit_label(long_distance=True)
         length_unit = self.length_unit_label()
         speed_unit = self.speed_unit_label()
+        accel_unit = self.accel_unit_label()
+        jerk_unit = self.jerk_unit_label()
 
         grid.addWidget(self.create_metric_card("Total Distance", self.format_length(stats["distance_total"], long_distance=True), long_distance_unit, "#E3F2FD", key="distance_total"), 0, 0)
         grid.addWidget(self.create_metric_card("Autonomous Distance", self.format_length(stats["autonomous_distance"], long_distance=True), long_distance_unit, "#E8F5E9", key="autonomous_distance"), 0, 1)
@@ -3668,10 +3996,15 @@ class EvaluationGUI(QMainWindow):
         grid.addWidget(self.create_metric_card("Brake Events", f"{stats['brake_event_count']}", "", "#FFF9C4", key="brake_event_count"), 1, 2)
         grid.addWidget(self.create_metric_card("Harsh Brakes", f"{stats['harsh_brake_count']}", "", "#FFAB91", key="harsh_brake_count"), 1, 3)
 
-        grid.addWidget(self.create_metric_card("Mean Lateral Error", self.format_length(stats["mean_lat"]), length_unit, "#E1F5FE", key="mean_lat"), 2, 0)
-        grid.addWidget(self.create_metric_card("RMS Lateral Error", self.format_length(stats["rms_lat"]), length_unit, "#B3E5FC", key="rms_lat"), 2, 1)
-        grid.addWidget(self.create_metric_card("Max Lateral Error", self.format_length(stats["max_lat"]), length_unit, "#81D4FA", key="max_lat"), 2, 2)
-        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", self.format_speed(stats["mean_vel_err"]), speed_unit, "#D1C4E9", key="mean_vel_err"), 2, 3)
+        grid.addWidget(self.create_metric_card("Brake Time", f"{stats['brake_time_pct']:.1f}", "%", "#FFF3E0", key="brake_time_pct"), 2, 0)
+        grid.addWidget(self.create_metric_card("Max Brake Decel", self.format_accel(stats["max_brake_decel_mps2"]), accel_unit, "#FFE0B2", key="max_brake_decel"), 2, 1)
+        grid.addWidget(self.create_metric_card("Max Brake Jerk", self.format_jerk(stats["max_brake_jerk_mps3"]), jerk_unit, "#FFCCBC", key="max_brake_jerk"), 2, 2)
+        grid.addWidget(self.create_metric_card("Max Speed Drop", self.format_speed(stats["max_speed_drop_mps"]), speed_unit, "#FFCDD2", key="max_speed_drop"), 2, 3)
+
+        grid.addWidget(self.create_metric_card("Mean Lateral Error", self.format_length(stats["mean_lat"]), length_unit, "#E1F5FE", key="mean_lat"), 3, 0)
+        grid.addWidget(self.create_metric_card("RMS Lateral Error", self.format_length(stats["rms_lat"]), length_unit, "#B3E5FC", key="rms_lat"), 3, 1)
+        grid.addWidget(self.create_metric_card("Max Lateral Error", self.format_length(stats["max_lat"]), length_unit, "#81D4FA", key="max_lat"), 3, 2)
+        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", self.format_speed(stats["mean_vel_err"]), speed_unit, "#D1C4E9", key="mean_vel_err"), 3, 3)
 
         layout.addLayout(grid)
 
@@ -3714,6 +4047,8 @@ class EvaluationGUI(QMainWindow):
         length_unit = self.length_unit_label()
         speed_unit = self.speed_unit_label()
         accel_unit = self.accel_unit_label()
+        jerk_unit = self.jerk_unit_label()
+        rate_unit = self.rate_distance_label()
         return [
             ("Bag", "label", None),
             ("Storage", "storage_id", None),
@@ -3724,6 +4059,12 @@ class EvaluationGUI(QMainWindow):
             ("Mode Changes", "mode_change_count", "{:.0f}"),
             ("Brake Events", "brake_event_count", "{:.0f}"),
             ("Harsh Brakes", "harsh_brake_count", "{:.0f}"),
+            (f"Brake Events/{rate_unit}", "brake_events_per_km", "{:.2f}"),
+            (f"Harsh/{rate_unit}", "harsh_per_km", "{:.2f}"),
+            ("Brake Time [%]", "brake_time_pct", "{:.1f}"),
+            (f"Max Brake Decel [{accel_unit}]", "max_brake_decel_mps2", "{:.2f}"),
+            (f"Max Brake Jerk [{jerk_unit}]", "max_brake_jerk_mps3", "{:.2f}"),
+            (f"Max Speed Drop [{speed_unit}]", "max_speed_drop_mps", "{:.2f}"),
             (f"Mean Lat [{length_unit}]", "mean_lateral_error_m", "{:.3f}"),
             (f"RMS Lat [{length_unit}]", "rms_lateral_error_m", "{:.3f}"),
             (f"Max Lat [{length_unit}]", "max_lateral_error_m", "{:.3f}"),
@@ -3745,6 +4086,8 @@ class EvaluationGUI(QMainWindow):
         length_unit = self.length_unit_label()
         speed_unit = self.speed_unit_label()
         accel_unit = self.accel_unit_label()
+        jerk_unit = self.jerk_unit_label()
+        rate_unit = self.rate_distance_label()
         return [
             ("RMS lateral error", "rms_lateral_error_m", f"RMS lateral error [{length_unit}]"),
             ("Mean lateral error", "mean_lateral_error_m", f"Mean lateral error [{length_unit}]"),
@@ -3758,6 +4101,13 @@ class EvaluationGUI(QMainWindow):
             ("Takeovers", "takeover_count", "Takeovers"),
             ("Brake events", "brake_event_count", "Brake events"),
             ("Harsh brakes", "harsh_brake_count", "Harsh brakes"),
+            ("Brake events per distance", "brake_events_per_km", f"Brake events/{rate_unit}"),
+            ("Harsh brakes per distance", "harsh_per_km", f"Harsh brakes/{rate_unit}"),
+            ("Brake time percent", "brake_time_pct", "Brake time [%]"),
+            ("Max brake decel", "max_brake_decel_mps2", f"Max brake decel [{accel_unit}]"),
+            ("95th brake decel", "p95_brake_decel_mps2", f"95th brake decel [{accel_unit}]"),
+            ("Max brake jerk", "max_brake_jerk_mps3", f"Max brake jerk [{jerk_unit}]"),
+            ("Max speed drop", "max_speed_drop_mps", f"Max speed drop [{speed_unit}]"),
             ("Mean speed", "mean_speed_mps", f"Mean speed [{speed_unit}]"),
             ("Max speed", "max_speed_mps", f"Max speed [{speed_unit}]"),
             ("Mean abs acceleration", "mean_abs_accel_mps2", f"Mean |acceleration| [{accel_unit}]"),
@@ -4416,65 +4766,137 @@ class EvaluationGUI(QMainWindow):
         widget.setLayout(layout)
         return widget
 
+    def topic_decode_status_text(self, topic, sample_count):
+        topic_type = self.results.topic_types.get(topic)
+        if topic_type is None:
+            return f"{topic}: not found in loaded bag."
+
+        load_error = self.results.topic_load_errors.get(topic)
+        if load_error:
+            return (
+                f"{topic}: found as {topic_type}, but could not decode it. "
+                f"{load_error}. Install/source that message package, then reload the bag."
+            )
+
+        if sample_count == 0:
+            return f"{topic}: found as {topic_type}, but 0 samples were decoded."
+
+        return f"{topic}: {sample_count} samples loaded ({topic_type})."
+
     def create_braking_tab(self):
         widget = QWidget()
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+
+        content_widget = QWidget()
         layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
 
         r = self.results
+
+        time_scroll_layout = QHBoxLayout()
+        self.braking_time_scroll = QSlider(Qt.Horizontal)
+        self.braking_time_scroll.setRange(0, 10000)
+        self.braking_time_scroll.setSingleStep(10)
+        self.braking_time_scroll.setPageStep(250)
+        self.braking_time_scroll.setEnabled(self.route_time_range()[0] is not None)
+        self.braking_time_scroll.setToolTip(
+            "Scroll through route time. All braking graph cursors follow this time."
+        )
+        self.braking_time_scroll.valueChanged.connect(self.on_route_time_scroll_changed)
+
+        self.braking_time_label = QLabel("Time --")
+        self.braking_time_label.setMinimumWidth(95)
+        self.braking_time_label.setToolTip("Selected time from route start.")
+
+        time_scroll_layout.addWidget(QLabel("Braking Time Scroll"))
+        time_scroll_layout.addWidget(self.braking_time_scroll, 1)
+        time_scroll_layout.addWidget(self.braking_time_label)
+        layout.addLayout(time_scroll_layout)
+
+        status_label = QLabel(
+            "\n".join(
+                [
+                    self.topic_decode_status_text(TOPIC_BRAKE_2_REPORT, len(r.brake_pressure_reports)),
+                    self.topic_decode_status_text(TOPIC_BRAKE_REPORT, len(r.brake_reports)),
+                ]
+            )
+        )
+        status_label.setWordWrap(True)
+        status_label.setStyleSheet("color: #37474F; padding: 4px;")
+        layout.addWidget(status_label)
 
         if r.brake_pressure_reports:
             t0_pressure = r.brake_pressure_reports[0].t
             pressure_ts = [sample.t - t0_pressure for sample in r.brake_pressure_reports]
             pressure_values = [sample.brake_pressure for sample in r.brake_pressure_reports]
+        else:
+            t0_pressure = None
+            pressure_ts = []
+            pressure_values = []
 
-            pressure_canvas = PlotCanvas(width=10, height=3)
-            pressure_canvas.plot_xy(
-                pressure_ts,
-                pressure_values,
-                "Brake Pressure Report",
-                "Time [s]",
-                "Brake pressure",
-                location_mapper=self.route_location_mapper,
-                time_origin=t0_pressure,
-                location_unit_label=self.route_distance_unit_label(),
-                location_scale=self.route_distance_scale(),
-            )
-            self.add_plot_with_toolbar(layout, pressure_canvas, "Brake Pressure Report")
+        pressure_canvas = PlotCanvas(width=10, height=3)
+        pressure_canvas.plot_xy(
+            pressure_ts,
+            pressure_values,
+            "Brake Pressure Report",
+            "Time [s]",
+            "Brake pressure",
+            location_mapper=self.route_location_mapper,
+            time_origin=t0_pressure,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
+        )
+        pressure_canvas.setMinimumHeight(340)
+        pressure_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_plot_with_toolbar(layout, pressure_canvas, "Brake Pressure Report")
 
         if r.brake_reports:
             t0_report = r.brake_reports[0].t
             pedal_ts = [sample.t - t0_report for sample in r.brake_reports]
             pedal_values = [sample.pedal_output for sample in r.brake_reports]
-
-            pedal_canvas = PlotCanvas(width=10, height=3)
-            pedal_canvas.plot_xy(
-                pedal_ts,
-                pedal_values,
-                "Brake Pedal Output Report",
-                "Time [s]",
-                "Pedal output [%]",
-                location_mapper=self.route_location_mapper,
-                time_origin=t0_report,
-                location_unit_label=self.route_distance_unit_label(),
-                location_scale=self.route_distance_scale(),
-            )
-            self.add_plot_with_toolbar(layout, pedal_canvas, "Brake Pedal Output Report")
-
             torque_values = [sample.brake_torque_actual for sample in r.brake_reports]
-            if any(np.isfinite(torque_values)):
-                torque_canvas = PlotCanvas(width=10, height=3)
-                torque_canvas.plot_xy(
-                    pedal_ts,
-                    torque_values,
-                    "Brake Torque Actual Report",
-                    "Time [s]",
-                    "Brake torque actual",
-                    location_mapper=self.route_location_mapper,
-                    time_origin=t0_report,
-                    location_unit_label=self.route_distance_unit_label(),
-                    location_scale=self.route_distance_scale(),
-                )
-                self.add_plot_with_toolbar(layout, torque_canvas, "Brake Torque Actual Report")
+        else:
+            t0_report = None
+            pedal_ts = []
+            pedal_values = []
+            torque_values = []
+
+        pedal_canvas = PlotCanvas(width=10, height=3)
+        pedal_canvas.plot_xy(
+            pedal_ts,
+            pedal_values,
+            "Brake Pedal Output Report",
+            "Time [s]",
+            "Pedal output [%]",
+            location_mapper=self.route_location_mapper,
+            time_origin=t0_report,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
+        )
+        pedal_canvas.setMinimumHeight(340)
+        pedal_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_plot_with_toolbar(layout, pedal_canvas, "Brake Pedal Output Report")
+
+        torque_canvas = PlotCanvas(width=10, height=3)
+        torque_canvas.plot_xy(
+            pedal_ts,
+            torque_values,
+            "Brake Torque Actual Report",
+            "Time [s]",
+            "Brake torque actual",
+            location_mapper=self.route_location_mapper,
+            time_origin=t0_report,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
+        )
+        torque_canvas.setMinimumHeight(340)
+        torque_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_plot_with_toolbar(layout, torque_canvas, "Brake Torque Actual Report")
 
         if len(r.velocities) >= 3:
             ts = np.array([v.t for v in r.velocities])
@@ -4510,20 +4932,30 @@ class EvaluationGUI(QMainWindow):
             location_unit_label=self.route_distance_unit_label(),
             location_scale=self.route_distance_scale(),
         )
+        canvas.setMinimumHeight(430)
+        canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         table = QTableWidget()
         self.add_plot_with_toolbar(layout, canvas, "Estimated Longitudinal Acceleration")
+        table.setMinimumHeight(260)
 
-        table.setColumnCount(7)
-        table.setHorizontalHeaderLabels([
+        brake_columns = [
             "Start [s]",
             "End [s]",
             "Duration [s]",
+            "Type",
             "Source",
             "Peak Signal",
-            f"Min Accel [{self.accel_unit_label()}]",
-            "Type",
-        ])
+            f"Initial Speed [{self.speed_unit_label()}]",
+            f"Speed Drop [{self.speed_unit_label()}]",
+            f"Distance [{self.length_unit_label()}]",
+            f"Peak Decel [{self.accel_unit_label()}]",
+            f"Avg Decel [{self.accel_unit_label()}]",
+            f"Max Jerk [{self.jerk_unit_label()}]",
+            "Reason",
+        ]
+        table.setColumnCount(len(brake_columns))
+        table.setHorizontalHeaderLabels(brake_columns)
         table.setRowCount(len(r.brake_events))
 
         if r.brake_events:
@@ -4541,17 +4973,33 @@ class EvaluationGUI(QMainWindow):
             if np.isfinite(e.min_accel):
                 min_accel = self.format_accel(e.min_accel)
 
-            table.setItem(row, 0, QTableWidgetItem(f"{e.start_t - t0:.2f}"))
-            table.setItem(row, 1, QTableWidgetItem(f"{e.end_t - t0:.2f}"))
-            table.setItem(row, 2, QTableWidgetItem(f"{e.end_t - e.start_t:.2f}"))
-            table.setItem(row, 3, QTableWidgetItem(e.source))
-            table.setItem(row, 4, QTableWidgetItem(peak_signal))
-            table.setItem(row, 5, QTableWidgetItem(min_accel))
-            table.setItem(row, 6, QTableWidgetItem(e.event_type))
+            values = [
+                f"{e.start_t - t0:.2f}",
+                f"{e.end_t - t0:.2f}",
+                f"{e.end_t - e.start_t:.2f}",
+                e.event_type,
+                e.source,
+                peak_signal,
+                self.format_speed(e.initial_speed) if np.isfinite(e.initial_speed) else "--",
+                self.format_speed(e.speed_drop) if np.isfinite(e.speed_drop) else "--",
+                self.format_length(e.distance_m) if np.isfinite(e.distance_m) else "--",
+                self.format_accel(e.peak_decel) if np.isfinite(e.peak_decel) else min_accel,
+                self.format_accel(e.avg_decel) if np.isfinite(e.avg_decel) else "--",
+                self.format_jerk(e.max_jerk) if np.isfinite(e.max_jerk) else "--",
+                e.harsh_reasons,
+            ]
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem(value))
+
+        table.resizeColumnsToContents()
 
         layout.addWidget(table)
+        layout.addStretch()
 
-        widget.setLayout(layout)
+        content_widget.setLayout(layout)
+        scroll_area.setWidget(content_widget)
+        outer_layout.addWidget(scroll_area)
+        widget.setLayout(outer_layout)
         return widget
 
     def create_events_tab(self):
@@ -4646,6 +5094,7 @@ class EvaluationGUI(QMainWindow):
         speed_unit = self.speed_unit_label()
         rate_distance_unit = self.rate_distance_label()
         takeover_rate = self.rate_per_display_distance(stats["takeover_count"], stats["distance_total"])
+        brake_rate = self.rate_per_display_distance(stats["brake_event_count"], stats["distance_total"])
         harsh_rate = self.rate_per_display_distance(stats["harsh_brake_count"], stats["distance_total"])
 
         text = f"""
@@ -4680,10 +5129,19 @@ Maximum absolute velocity error:    {self.format_speed(stats['max_vel_err'])} {s
 
 BRAKING / COMFORT PERFORMANCE
 -----------------------------
-Brake event source:                 {self.brake_event_source_text()}
-Brake event count:                  {stats['brake_event_count']}
-Harsh brake count:                  {stats['harsh_brake_count']}
-Harsh brake rate:                   {harsh_rate:.2f} harsh brakes/{rate_distance_unit}
+	Brake event source:                 {self.brake_event_source_text()}
+	Brake event count:                  {stats['brake_event_count']}
+	Brake event rate:                   {brake_rate:.2f} brake events/{rate_distance_unit}
+	Brake time:                         {stats['brake_time_s']:.2f} s ({stats['brake_time_pct']:.2f} %)
+	Average brake duration:             {stats['avg_brake_duration_s']:.2f} s
+	Harsh brake count:                  {stats['harsh_brake_count']}
+	Harsh brake rate:                   {harsh_rate:.2f} harsh brakes/{rate_distance_unit}
+	Max brake deceleration:             {self.format_accel(stats['max_brake_decel_mps2'])} {self.accel_unit_label()}
+	95th percentile brake deceleration: {self.format_accel(stats['p95_brake_decel_mps2'])} {self.accel_unit_label()}
+	Max brake jerk:                     {self.format_jerk(stats['max_brake_jerk_mps3'])} {self.jerk_unit_label()}
+	95th percentile brake jerk:         {self.format_jerk(stats['p95_brake_jerk_mps3'])} {self.jerk_unit_label()}
+	Max speed drop in brake event:      {self.format_speed(stats['max_speed_drop_mps'])} {speed_unit}
+	Total braking distance:             {self.format_length(stats['total_brake_distance_m'], long_distance=True)} {long_distance_unit}
 
 OUTLIER FILTERING
 -----------------
@@ -4698,10 +5156,14 @@ Stop reason message count:          {r.stop_reason_count}
 
 INTERPRETATION
 --------------
-This report estimates route-level autonomy, trajectory tracking quality,
-braking behavior, and intervention frequency from the recorded Autoware bag.
+	This report estimates route-level autonomy, trajectory tracking quality,
+	braking behavior, and intervention frequency from the recorded Autoware bag.
+	Brake events are detected from brake pressure/pedal topics when available;
+	harsh classification uses peak deceleration >= {HARSH_DECEL_THRESHOLD_MPS2:.1f} m/s^2,
+	jerk >= {HARSH_JERK_THRESHOLD_MPS3:.1f} m/s^3, or a speed drop >= {HARSH_SPEED_DROP_THRESHOLD_MPS:.1f} m/s
+	within {HARSH_SPEED_DROP_WINDOW_S:.1f}s. Short low-speed noise is ignored.
 
-If lateral error is high, check localization, map alignment, trajectory generation,
+	If lateral error is high, check localization, map alignment, trajectory generation,
 and control tuning. If takeover rate is high, inspect operation mode transitions,
 driver input reports, diagnostics, and stop reasons around each event.
 """
@@ -4834,10 +5296,16 @@ driver input reports, diagnostics, and stop reasons around each event.
                 f"{event.start_t - t0:.2f}",
                 f"{event.end_t - t0:.2f}",
                 f"{event.end_t - event.start_t:.2f}",
+                event.event_type,
                 event.source,
                 peak_signal,
-                min_accel,
-                event.event_type,
+                self.format_speed(event.initial_speed) if np.isfinite(event.initial_speed) else "--",
+                self.format_speed(event.speed_drop) if np.isfinite(event.speed_drop) else "--",
+                self.format_length(event.distance_m) if np.isfinite(event.distance_m) else "--",
+                self.format_accel(event.peak_decel) if np.isfinite(event.peak_decel) else min_accel,
+                self.format_accel(event.avg_decel) if np.isfinite(event.avg_decel) else "--",
+                self.format_jerk(event.max_jerk) if np.isfinite(event.max_jerk) else "--",
+                event.harsh_reasons,
             ])
 
         return rows
@@ -4879,10 +5347,16 @@ driver input reports, diagnostics, and stop reasons around each event.
                         "Start [s]",
                         "End [s]",
                         "Duration [s]",
+                        "Type",
                         "Source",
                         "Peak Signal",
-                        f"Min Accel [{self.accel_unit_label()}]",
-                        "Type",
+                        f"Initial Speed [{self.speed_unit_label()}]",
+                        f"Speed Drop [{self.speed_unit_label()}]",
+                        f"Distance [{self.length_unit_label()}]",
+                        f"Peak Decel [{self.accel_unit_label()}]",
+                        f"Avg Decel [{self.accel_unit_label()}]",
+                        f"Max Jerk [{self.jerk_unit_label()}]",
+                        "Reason",
                     ],
                     self.brake_event_rows(),
                 )
@@ -4926,7 +5400,21 @@ driver input reports, diagnostics, and stop reasons around each event.
             "mode_change_count": [stats["mode_change_count"]],
             "brake_event_count": [stats["brake_event_count"]],
             "brake_event_source": [self.brake_event_source_text()],
+            "brake_events_per_km": [stats["brake_events_per_km"]],
+            "brake_time_s": [stats["brake_time_s"]],
+            "brake_time_percent": [stats["brake_time_pct"]],
+            "avg_brake_duration_s": [stats["avg_brake_duration_s"]],
+            "max_brake_duration_s": [stats["max_brake_duration_s"]],
             "harsh_brake_count": [stats["harsh_brake_count"]],
+            "harsh_brakes_per_km": [stats["harsh_per_km"]],
+            "mean_brake_decel_mps2": [stats["mean_brake_decel_mps2"]],
+            "max_brake_decel_mps2": [stats["max_brake_decel_mps2"]],
+            "p95_brake_decel_mps2": [stats["p95_brake_decel_mps2"]],
+            "max_brake_jerk_mps3": [stats["max_brake_jerk_mps3"]],
+            "p95_brake_jerk_mps3": [stats["p95_brake_jerk_mps3"]],
+            "mean_speed_drop_mps": [stats["mean_speed_drop_mps"]],
+            "max_speed_drop_mps": [stats["max_speed_drop_mps"]],
+            "total_brake_distance_m": [stats["total_brake_distance_m"]],
             "mean_lateral_error_m_filtered": [stats["mean_lat"]],
             "rms_lateral_error_m_filtered": [stats["rms_lat"]],
             "max_lateral_error_m_filtered": [stats["max_lat"]],
@@ -4966,12 +5454,19 @@ driver input reports, diagnostics, and stop reasons around each event.
                         "end_time_s": e.end_t,
                         "duration_s": e.end_t - e.start_t,
                         "min_accel_mps2": e.min_accel,
+                        "peak_decel_mps2": e.peak_decel,
+                        "avg_decel_mps2": e.avg_decel,
                         "max_jerk_mps3": e.max_jerk,
+                        "initial_speed_mps": e.initial_speed,
+                        "final_speed_mps": e.final_speed,
+                        "speed_drop_mps": e.speed_drop,
+                        "distance_m": e.distance_m,
                         "source": e.source,
                         "peak_signal": e.peak_signal,
                         "signal_name": e.signal_name,
                         "signal_unit": e.signal_unit,
                         "type": e.event_type,
+                        "harsh_reasons": e.harsh_reasons,
                     }
                 )
 
