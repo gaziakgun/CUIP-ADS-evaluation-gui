@@ -5,6 +5,10 @@
 # ============================================================
 #
 # Usage:
+#   ./autoware_bag_eval_gui.py
+#   Then choose a ROS 2 bag folder from the GUI.
+#
+# Or load a bag immediately:
 #   chmod +x autoware_bag_eval_gui.py
 #   ./autoware_bag_eval_gui.py --bag test_route_01
 #
@@ -90,6 +94,8 @@ TOPIC_STOP_REASONS = "/planning/scenario_planning/status/stop_reasons"
 
 TOPIC_DRIVER_INPUT = "/raptor_dbw_interface/driver_input_report"
 TOPIC_BRAKE_CMD = "/raptor_dbw_interface/brake_cmd"
+TOPIC_BRAKE_REPORT = "/raptor_dbw_interface/brake_report"
+TOPIC_BRAKE_2_REPORT = "/raptor_dbw_interface/brake_2_report"
 TOPIC_DBW_ENABLED = "/raptor_dbw_interface/dbw_enabled"
 TOPIC_NOVATEL_ODOM = "/sensing/novatel/oem7/odom"
 
@@ -100,10 +106,21 @@ EVALUATION_TOPICS = {
     TOPIC_VELOCITY,
     TOPIC_OPERATION_MODE,
     TOPIC_STOP_REASONS,
+    TOPIC_BRAKE_REPORT,
+    TOPIC_BRAKE_2_REPORT,
 }
 
 OUTLIER_MAD_THRESHOLD = 5.0
 OUTLIER_MIN_SAMPLES = 10
+
+DEFAULT_MAP_ORIGIN_LAT = 35.0422327201
+DEFAULT_MAP_ORIGIN_LON = -85.2983169612
+DEFAULT_MAP_ORIGIN_YAW_DEG = 0.0
+
+M_TO_FT = 3.280839895013123
+M_TO_MI = 0.000621371192237334
+MPS_TO_MPH = 2.2369362920544
+KM_PER_MILE = 1.609344
 
 
 # ============================================================
@@ -155,6 +172,31 @@ class BrakeEvent:
     min_accel: float
     max_jerk: float
     event_type: str
+    source: str = "velocity_deceleration"
+    peak_signal: float = math.nan
+    signal_name: str = ""
+    signal_unit: str = ""
+
+
+@dataclass
+class BrakeReportSample:
+    t: float
+    pedal_position: float = math.nan
+    pedal_output: float = math.nan
+    brake_torque_actual: float = math.nan
+    enabled: bool = False
+    driver_activity: bool = False
+    fault_brake_system: bool = False
+    intervention_active: bool = False
+    intervention_ready: bool = False
+
+
+@dataclass
+class BrakePressureSample:
+    t: float
+    brake_pressure: float = math.nan
+    estimated_road_slope: float = math.nan
+    speed_set_point: float = math.nan
 
 
 @dataclass
@@ -177,6 +219,8 @@ class EvalResults:
     takeover_count: int = 0
     mode_change_count: int = 0
     brake_events: list = field(default_factory=list)
+    brake_reports: list = field(default_factory=list)
+    brake_pressure_reports: list = field(default_factory=list)
     harsh_brake_count: int = 0
 
     stop_reason_count: int = 0
@@ -598,6 +642,37 @@ def get_trajectory_from_msg(msg, fallback_time):
     )
 
 
+def get_brake_report_from_msg(msg, fallback_time):
+    t = fallback_time
+    if hasattr(msg, "header"):
+        t = stamp_to_sec(msg.header.stamp)
+
+    return BrakeReportSample(
+        t=t,
+        pedal_position=float(safe_getattr(msg, "pedal_position", math.nan)),
+        pedal_output=float(safe_getattr(msg, "pedal_output", math.nan)),
+        brake_torque_actual=float(safe_getattr(msg, "brake_torque_actual", math.nan)),
+        enabled=bool(safe_getattr(msg, "enabled", False)),
+        driver_activity=bool(safe_getattr(msg, "driver_activity", False)),
+        fault_brake_system=bool(safe_getattr(msg, "fault_brake_system", False)),
+        intervention_active=bool(safe_getattr(msg, "intervention_active", False)),
+        intervention_ready=bool(safe_getattr(msg, "intervention_ready", False)),
+    )
+
+
+def get_brake_pressure_from_msg(msg, fallback_time):
+    t = fallback_time
+    if hasattr(msg, "header"):
+        t = stamp_to_sec(msg.header.stamp)
+
+    return BrakePressureSample(
+        t=t,
+        brake_pressure=float(safe_getattr(msg, "brake_pressure", math.nan)),
+        estimated_road_slope=float(safe_getattr(msg, "estimated_road_slope", math.nan)),
+        speed_set_point=float(safe_getattr(msg, "speed_set_point", math.nan)),
+    )
+
+
 def find_nearest_trajectory(trajectories, t, max_dt=1.0, trajectory_times=None):
     if not trajectories:
         return None
@@ -863,12 +938,149 @@ def compute_brake_events(velocities, accel_threshold=-0.5, harsh_threshold=-3.0)
                         min_accel=min_accel,
                         max_jerk=max_jerk,
                         event_type=event_type,
+                        source="velocity_deceleration",
+                        peak_signal=max(0.0, -min_accel),
+                        signal_name="deceleration",
+                        signal_unit="m/s^2",
                     )
                 )
 
             in_event = False
 
     return events
+
+
+def compute_brake_signal_events(
+    times,
+    values,
+    source,
+    signal_name,
+    signal_unit="",
+    activation_threshold=None,
+    harsh_threshold=None,
+):
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+
+    finite = np.isfinite(times) & np.isfinite(values)
+    if int(np.count_nonzero(finite)) < 2:
+        return []
+
+    times = times[finite]
+    values = values[finite]
+    order = np.argsort(times)
+    times = times[order]
+    values = values[order]
+
+    positive_values = values[values > 0.0]
+    if len(positive_values) == 0:
+        return []
+
+    peak_value = float(np.max(positive_values))
+    if activation_threshold is None:
+        activation_threshold = max(0.05 * peak_value, 0.1)
+    if harsh_threshold is None:
+        harsh_threshold = max(0.75 * peak_value, activation_threshold * 2.0)
+
+    events = []
+    in_event = False
+    start_idx = 0
+
+    for i, value in enumerate(values):
+        active = value > activation_threshold
+
+        if active and not in_event:
+            in_event = True
+            start_idx = i
+
+        if in_event and (not active or i == len(values) - 1):
+            end_idx = i if active else max(start_idx, i - 1)
+            event_values = values[start_idx:end_idx + 1]
+
+            if len(event_values) > 0:
+                event_peak = float(np.max(event_values))
+                events.append(
+                    BrakeEvent(
+                        start_t=float(times[start_idx]),
+                        end_t=float(times[end_idx]),
+                        min_accel=math.nan,
+                        max_jerk=math.nan,
+                        event_type="HARSH" if event_peak >= harsh_threshold else "NORMAL",
+                        source=source,
+                        peak_signal=event_peak,
+                        signal_name=signal_name,
+                        signal_unit=signal_unit,
+                    )
+                )
+
+            in_event = False
+
+    return events
+
+
+def brake_pressure_arrays(brake_pressure_reports):
+    if not brake_pressure_reports:
+        return np.array([]), np.array([])
+
+    times = np.array([sample.t for sample in brake_pressure_reports], dtype=float)
+    values = np.array([sample.brake_pressure for sample in brake_pressure_reports], dtype=float)
+    return times, values
+
+
+def brake_report_signal_arrays(brake_reports):
+    if not brake_reports:
+        return np.array([]), np.array([]), "", ""
+
+    times = np.array([sample.t for sample in brake_reports], dtype=float)
+    pedal_output = np.array([sample.pedal_output for sample in brake_reports], dtype=float)
+    brake_torque = np.array([sample.brake_torque_actual for sample in brake_reports], dtype=float)
+    pedal_position = np.array([sample.pedal_position for sample in brake_reports], dtype=float)
+
+    if np.any(np.isfinite(pedal_output)):
+        return times, pedal_output, "pedal output", "%"
+    if np.any(np.isfinite(brake_torque)):
+        return times, brake_torque, "brake torque", ""
+
+    return times, pedal_position, "pedal position", "%"
+
+
+def brake_heatmap_signal_arrays(velocities, brake_reports=None, brake_pressure_reports=None):
+    pressure_times, pressure_values = brake_pressure_arrays(brake_pressure_reports)
+    if len(pressure_times) > 0:
+        return pressure_times, pressure_values, "brake pressure", ""
+
+    report_times, report_values, signal_name, signal_unit = brake_report_signal_arrays(brake_reports)
+    if len(report_times) > 0:
+        return report_times, report_values, signal_name, signal_unit
+
+    accel_times, accel_values = compute_acceleration_arrays(velocities)
+    if len(accel_times) == 0:
+        return np.array([]), np.array([]), "deceleration", "m/s^2"
+
+    return accel_times, np.maximum(0.0, -accel_values), "deceleration", "m/s^2"
+
+
+def compute_direct_brake_events(brake_reports=None, brake_pressure_reports=None):
+    pressure_times, pressure_values = brake_pressure_arrays(brake_pressure_reports)
+    if len(pressure_times) > 0:
+        return compute_brake_signal_events(
+            pressure_times,
+            pressure_values,
+            source=TOPIC_BRAKE_2_REPORT,
+            signal_name="brake pressure",
+        )
+
+    report_times, report_values, signal_name, signal_unit = brake_report_signal_arrays(brake_reports)
+    if len(report_times) > 0:
+        return compute_brake_signal_events(
+            report_times,
+            report_values,
+            source=TOPIC_BRAKE_REPORT,
+            signal_name=signal_name,
+            signal_unit=signal_unit,
+        )
+
+    return []
 
 
 def compute_acceleration_arrays(velocities):
@@ -1128,6 +1340,8 @@ def results_time_range(results):
         results.controls,
         results.modes,
         results.trajectories,
+        results.brake_reports,
+        results.brake_pressure_reports,
     ):
         if samples:
             times.extend([samples[0].t, samples[-1].t])
@@ -1290,11 +1504,23 @@ def build_global_pose_samples(poses, origin_lat, origin_lon, origin_yaw_deg):
     return samples
 
 
-def create_heatmap_values(global_samples, velocities, trajectories, metric, modes=None):
+def create_heatmap_values(
+    global_samples,
+    velocities,
+    trajectories,
+    metric,
+    modes=None,
+    brake_reports=None,
+    brake_pressure_reports=None,
+):
     velocity_times = sample_times(velocities) if velocities else np.array([])
     velocity_values = np.array([v.v for v in velocities], dtype=float) if velocities else np.array([])
     trajectory_times = sample_times(trajectories) if trajectories else np.array([])
-    accel_times, accel_values = compute_acceleration_arrays(velocities)
+    brake_times, brake_values, _, _ = brake_heatmap_signal_arrays(
+        velocities,
+        brake_reports=brake_reports,
+        brake_pressure_reports=brake_pressure_reports,
+    )
     mode_times = sample_times(modes) if modes else np.array([])
 
     xs = []
@@ -1322,11 +1548,11 @@ def create_heatmap_values(global_samples, velocities, trajectories, metric, mode
                 value, _, _ = compute_nearest_path_error(pose, traj)
 
         elif metric == "brake":
-            idx = nearest_time_index(accel_times, pose.t)
+            idx = nearest_time_index(brake_times, pose.t)
             if idx is None:
                 value = math.nan
             else:
-                value = max(0.0, -float(accel_values[idx]))
+                value = max(0.0, float(brake_values[idx]))
 
         elif metric == "density":
             value = 1.0
@@ -1377,6 +1603,10 @@ def draw_osm_heatmap(
     bins=250,
     alpha=0.65,
     cmap="jet",
+    value_converter=None,
+    metric_units_override=None,
+    brake_reports=None,
+    brake_pressure_reports=None,
 ):
     xs, ys, values, removed_outliers = create_heatmap_values(
         global_samples,
@@ -1384,6 +1614,8 @@ def draw_osm_heatmap(
         trajectories,
         metric,
         modes=modes,
+        brake_reports=brake_reports,
+        brake_pressure_reports=brake_pressure_reports,
     )
     route_xs = np.array([sample["mx"] for sample in global_samples], dtype=float)
     route_ys = np.array([sample["my"] for sample in global_samples], dtype=float)
@@ -1410,6 +1642,8 @@ def draw_osm_heatmap(
         )
         heat = smooth_grid(counts, sigma)
         display_values = sample_grid_values(xs, ys, heat, extent)
+    elif value_converter is not None:
+        display_values = value_converter(values)
 
     norm, vmin, vmax = robust_norm(display_values, metric)
 
@@ -1492,6 +1726,8 @@ def draw_osm_heatmap(
         "density": "sample count",
         "operation_mode": "",
     }
+    if metric_units_override:
+        metric_units.update(metric_units_override)
 
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
@@ -1620,6 +1856,14 @@ class AutowareBagEvaluator:
             elif topic == TOPIC_STOP_REASONS:
                 self.results.stop_reason_count += 1
 
+            elif topic == TOPIC_BRAKE_REPORT:
+                report = get_brake_report_from_msg(msg, fallback_time)
+                self.results.brake_reports.append(report)
+
+            elif topic == TOPIC_BRAKE_2_REPORT:
+                report = get_brake_pressure_from_msg(msg, fallback_time)
+                self.results.brake_pressure_reports.append(report)
+
         self.post_process()
 
     def post_process(self):
@@ -1630,6 +1874,8 @@ class AutowareBagEvaluator:
         r.controls = sorted(r.controls, key=lambda c: c.t)
         r.modes = sorted(r.modes, key=lambda m: m.t)
         r.trajectories = sorted(r.trajectories, key=lambda tr: tr.t)
+        r.brake_reports = sorted(r.brake_reports, key=lambda b: b.t)
+        r.brake_pressure_reports = sorted(r.brake_pressure_reports, key=lambda b: b.t)
 
         r.distance_total = compute_distance(r.poses)
         r.autonomous_distance = compute_autonomous_distance(r.poses, r.modes)
@@ -1641,7 +1887,12 @@ class AutowareBagEvaluator:
             r.total_time,
         ) = compute_mode_stats(r.modes)
 
-        r.brake_events = compute_brake_events(r.velocities)
+        r.brake_events = compute_direct_brake_events(
+            r.brake_reports,
+            r.brake_pressure_reports,
+        )
+        if not r.brake_events:
+            r.brake_events = compute_brake_events(r.velocities)
         r.harsh_brake_count = sum(1 for e in r.brake_events if e.event_type == "HARSH")
 
         self.compute_tracking_errors()
@@ -1704,7 +1955,18 @@ class PlotCanvas(FigureCanvas):
         self.ax.set_title(title)
         self.fig.tight_layout()
 
-    def plot_xy(self, x, y, title, xlabel, ylabel, location_mapper=None, time_origin=None):
+    def plot_xy(
+        self,
+        x,
+        y,
+        title,
+        xlabel,
+        ylabel,
+        location_mapper=None,
+        time_origin=None,
+        location_unit_label="m",
+        location_scale=1.0,
+    ):
         self.clear_location_axis()
         self.ax.clear()
         self.has_time_cursor = False
@@ -1715,7 +1977,7 @@ class PlotCanvas(FigureCanvas):
         self.ax.set_xlabel(xlabel)
         self.ax.set_ylabel(ylabel)
         self.ax.grid(True)
-        self.add_location_axis(location_mapper, time_origin)
+        self.add_location_axis(location_mapper, time_origin, location_unit_label, location_scale)
         self.has_y_scale_controls = True
         self.apply_robust_y_scale()
         self.configure_time_cursor(x, time_origin)
@@ -1817,23 +2079,25 @@ class PlotCanvas(FigureCanvas):
 
         self.location_axis = None
 
-    def add_location_axis(self, location_mapper, time_origin):
+    def add_location_axis(self, location_mapper, time_origin, unit_label="m", distance_scale=1.0):
         if location_mapper is None or time_origin is None:
             return
         if not getattr(location_mapper, "available", False):
             return
 
         def time_to_distance(relative_time):
-            return location_mapper.time_to_distance(np.asarray(relative_time, dtype=float) + time_origin)
+            distance_m = location_mapper.time_to_distance(np.asarray(relative_time, dtype=float) + time_origin)
+            return distance_m * distance_scale
 
         def distance_to_time(distance):
-            return location_mapper.distance_to_time(np.asarray(distance, dtype=float)) - time_origin
+            distance_m = np.asarray(distance, dtype=float) / max(distance_scale, 1e-12)
+            return location_mapper.distance_to_time(distance_m) - time_origin
 
         self.location_axis = self.ax.secondary_xaxis(
             "top",
             functions=(time_to_distance, distance_to_time),
         )
-        self.location_axis.set_xlabel("Route distance [m]")
+        self.location_axis.set_xlabel(f"Route distance [{unit_label}]")
 
     def visible_y_values(self):
         xlim = self.ax.get_xlim()
@@ -2051,27 +2315,42 @@ class PlotCanvas(FigureCanvas):
 
 class EvaluationGUI(QMainWindow):
 
-    def __init__(self, results, bag_path, storage_id="sqlite3", heatmap_defaults=None):
+    def __init__(self, results=None, bag_path=None, storage_id="sqlite3", heatmap_defaults=None):
         super().__init__()
-        self.results = results
-        self.bag_path = bag_path
-        self.storage_id = storage_id
         self.heatmap_defaults = heatmap_defaults or {}
+        self.unit_system = "metric"
+
+        self.setWindowTitle("Autoware Autonomous Driving Evaluation Dashboard")
+        self.resize(1500, 900)
+
+        self.set_loaded_results(results, bag_path, storage_id)
+        self.setup_ui()
+        self.apply_adaptive_styles()
+
+    def set_loaded_results(self, results=None, bag_path=None, storage_id="sqlite3"):
+        self.results = results if results is not None else EvalResults()
+        self.bag_path = bag_path or ""
+        self.storage_id = storage_id
         self.route_location_mapper = RouteLocationMapper(self.results.poses)
         self.metric_cards = []
         self.metric_card_values = {}
-        self.compare_entries = [
-            CompareBag(
-                label=self.compare_label_for_path(bag_path),
-                bag_path=bag_path,
-                storage_id=storage_id,
-                results=results,
+        self.compare_entries = []
+        if self.bag_path:
+            self.compare_entries.append(
+                CompareBag(
+                    label=self.compare_label_for_path(self.bag_path),
+                    bag_path=self.bag_path,
+                    storage_id=storage_id,
+                    results=self.results,
+                )
             )
-        ]
         self.compare_table = None
         self.compare_metric_combo = None
         self.compare_bar_metric_combo = None
         self.compare_storage_combo = None
+        self.primary_storage_combo = None
+        self.units_combo = None
+        self.reload_bag_button = None
         self.compare_status = None
         self.compare_series_canvas = None
         self.compare_bar_canvas = None
@@ -2096,12 +2375,6 @@ class EvaluationGUI(QMainWindow):
         self.time_cursor_status = None
         self._last_style_scale = None
 
-        self.setWindowTitle("Autoware Autonomous Driving Evaluation Dashboard")
-        self.resize(1500, 900)
-
-        self.setup_ui()
-        self.apply_adaptive_styles()
-
     def setup_ui(self):
         main_widget = QWidget()
         self.main_widget = main_widget
@@ -2111,11 +2384,12 @@ class EvaluationGUI(QMainWindow):
         self.title_label = QLabel("Autoware Autonomous Driving Evaluation Dashboard")
         self.title_label.setAlignment(Qt.AlignCenter)
 
-        self.subtitle_label = QLabel(f"Bag: {self.bag_path}")
+        self.subtitle_label = QLabel(self.bag_status_text())
         self.subtitle_label.setAlignment(Qt.AlignCenter)
 
         main_layout.addWidget(self.title_label)
         main_layout.addWidget(self.subtitle_label)
+        main_layout.addLayout(self.create_bag_selector_layout())
 
         tabs = QTabWidget()
         self.tabs = tabs
@@ -2133,6 +2407,47 @@ class EvaluationGUI(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+    def bag_status_text(self):
+        if self.bag_path:
+            return f"Bag: {self.bag_path}"
+
+        return "No bag loaded. Select a ROS 2 bag folder to start evaluation."
+
+    def create_bag_selector_layout(self):
+        layout = QHBoxLayout()
+        layout.addWidget(QLabel("Bag storage"))
+
+        self.primary_storage_combo = QComboBox()
+        self.primary_storage_combo.addItems(["sqlite3", "mcap"])
+        storage_index = self.primary_storage_combo.findText(self.storage_id)
+        if storage_index >= 0:
+            self.primary_storage_combo.setCurrentIndex(storage_index)
+        layout.addWidget(self.primary_storage_combo)
+
+        select_button = QPushButton("Select Bag")
+        select_button.setToolTip("Choose the primary ROS 2 bag folder for this dashboard.")
+        select_button.clicked.connect(self.select_primary_bag_dialog)
+        layout.addWidget(select_button)
+
+        self.reload_bag_button = QPushButton("Reload Bag")
+        self.reload_bag_button.setToolTip("Re-read the currently selected primary bag.")
+        self.reload_bag_button.setEnabled(bool(self.bag_path))
+        self.reload_bag_button.clicked.connect(self.reload_primary_bag)
+        layout.addWidget(self.reload_bag_button)
+
+        layout.addWidget(QLabel("Units"))
+        self.units_combo = QComboBox()
+        self.units_combo.addItem("Metric", "metric")
+        self.units_combo.addItem("US Customary", "us")
+        units_index = self.units_combo.findData(self.unit_system)
+        if units_index >= 0:
+            self.units_combo.setCurrentIndex(units_index)
+        self.units_combo.currentIndexChanged.connect(self.on_unit_system_changed)
+        layout.addWidget(self.units_combo)
+
+        layout.addStretch()
+        return layout
+
     def compare_label_for_path(self, bag_path):
         label = os.path.basename(os.path.normpath(bag_path))
         return label or bag_path
@@ -2147,6 +2462,226 @@ class EvaluationGUI(QMainWindow):
         while f"{base_label} ({suffix})" in existing_labels:
             suffix += 1
         return f"{base_label} ({suffix})"
+
+    def select_primary_bag_dialog(self):
+        bag_path = QFileDialog.getExistingDirectory(self, "Select ROS 2 bag folder")
+        if not bag_path:
+            return
+
+        storage_id = self.primary_storage_combo.currentText() if self.primary_storage_combo is not None else self.storage_id
+        self.load_primary_bag(bag_path, storage_id)
+
+    def reload_primary_bag(self):
+        if not self.bag_path:
+            self.select_primary_bag_dialog()
+            return
+
+        storage_id = self.primary_storage_combo.currentText() if self.primary_storage_combo is not None else self.storage_id
+        self.load_primary_bag(self.bag_path, storage_id)
+
+    def on_unit_system_changed(self):
+        if self.units_combo is None:
+            return
+
+        unit_system = self.units_combo.currentData() or "metric"
+        if unit_system == self.unit_system:
+            return
+
+        self.unit_system = unit_system
+        self.reset_view_state_for_rebuild()
+        self.rebuild_ui()
+
+    def reset_view_state_for_rebuild(self):
+        self.metric_cards = []
+        self.metric_card_values = {}
+        self.compare_table = None
+        self.compare_metric_combo = None
+        self.compare_bar_metric_combo = None
+        self.compare_storage_combo = None
+        self.primary_storage_combo = None
+        self.units_combo = None
+        self.reload_bag_button = None
+        self.compare_status = None
+        self.compare_series_canvas = None
+        self.compare_bar_canvas = None
+        self.analysis_interval_status = None
+        self.plot_canvases = []
+        self.plot_entries = []
+        self.time_scroll_controls = []
+        self.selected_time = None
+        self._syncing_time_scrolls = False
+        self.heatmap_global_samples = []
+        self.heatmap_pose_times = np.array([])
+        self.heatmap_fig = None
+        self.heatmap_canvas = None
+        self.heatmap_marker = None
+        self.heatmap_marker_label = None
+        self.heatmap_time_scroll = None
+        self.heatmap_time_label = None
+        self.heatmap_save_button = None
+        self.heatmap_status = None
+        self.time_cursor_status = None
+        self._last_style_scale = None
+
+    def load_primary_bag(self, bag_path, storage_id):
+        normalized_path = os.path.abspath(bag_path)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        if hasattr(self, "subtitle_label") and self.subtitle_label is not None:
+            self.subtitle_label.setText(f"Reading bag: {normalized_path}")
+        QApplication.processEvents()
+
+        try:
+            evaluator = AutowareBagEvaluator(normalized_path, storage_id)
+            evaluator.read_bag()
+            self.set_loaded_results(evaluator.results, normalized_path, storage_id)
+            self.rebuild_ui()
+
+        except Exception as exc:
+            if hasattr(self, "subtitle_label") and self.subtitle_label is not None:
+                self.subtitle_label.setText(self.bag_status_text())
+            QMessageBox.warning(self, "Bag Load Error", str(exc))
+
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def rebuild_ui(self):
+        previous_central_widget = self.centralWidget()
+        if previous_central_widget is not None:
+            previous_central_widget.setParent(None)
+
+        self.setup_ui()
+        self.apply_adaptive_styles(force=True)
+
+    def use_us_units(self):
+        return self.unit_system == "us"
+
+    def length_unit_label(self, long_distance=False):
+        if self.use_us_units():
+            return "mi" if long_distance else "ft"
+        return "m"
+
+    def speed_unit_label(self):
+        return "mph" if self.use_us_units() else "m/s"
+
+    def accel_unit_label(self):
+        return "ft/s^2" if self.use_us_units() else "m/s^2"
+
+    def jerk_unit_label(self):
+        return "ft/s^3" if self.use_us_units() else "m/s^3"
+
+    def rate_distance_label(self):
+        return "mile" if self.use_us_units() else "km"
+
+    def route_distance_scale(self):
+        return M_TO_MI if self.use_us_units() else 1.0
+
+    def route_distance_unit_label(self):
+        return "mi" if self.use_us_units() else "m"
+
+    def convert_length(self, value_m, long_distance=False):
+        values = np.asarray(value_m, dtype=float)
+        if self.use_us_units():
+            return values * (M_TO_MI if long_distance else M_TO_FT)
+        return values
+
+    def convert_speed(self, value_mps):
+        values = np.asarray(value_mps, dtype=float)
+        if self.use_us_units():
+            return values * MPS_TO_MPH
+        return values
+
+    def convert_accel(self, value_mps2):
+        values = np.asarray(value_mps2, dtype=float)
+        if self.use_us_units():
+            return values * M_TO_FT
+        return values
+
+    def format_length(self, value_m, long_distance=False):
+        value = float(self.convert_length(value_m, long_distance=long_distance))
+        if long_distance:
+            return f"{value:.3f}" if self.use_us_units() else f"{value:.2f}"
+        return f"{value:.3f}"
+
+    def format_speed(self, value_mps):
+        return f"{float(self.convert_speed(value_mps)):.3f}"
+
+    def format_accel(self, value_mps2):
+        return f"{float(self.convert_accel(value_mps2)):.2f}"
+
+    def rate_per_display_distance(self, count, distance_m):
+        if distance_m <= 1e-6:
+            return 0.0
+
+        if self.use_us_units():
+            distance = distance_m * M_TO_MI
+        else:
+            distance = distance_m / 1000.0
+
+        if distance <= 1e-9:
+            return 0.0
+
+        return count / distance
+
+    def convert_compare_value(self, key, value):
+        if key in ("distance_total_m", "autonomous_distance_m"):
+            return float(self.convert_length(value, long_distance=True))
+        if key in ("mean_lateral_error_m", "rms_lateral_error_m", "max_lateral_error_m"):
+            return float(self.convert_length(value))
+        if key in (
+            "mean_abs_velocity_error_mps",
+            "max_abs_velocity_error_mps",
+            "mean_speed_mps",
+            "max_speed_mps",
+        ):
+            return float(self.convert_speed(value))
+        if key in ("mean_abs_accel_mps2", "max_abs_accel_mps2"):
+            return float(self.convert_accel(value))
+        return value
+
+    def convert_series_values(self, metric, values):
+        if metric == "lateral_error":
+            return self.convert_length(values), f"Lateral error [{self.length_unit_label()}]"
+        if metric == "velocity_error":
+            return self.convert_speed(values), f"Target - actual [{self.speed_unit_label()}]"
+        if metric == "vehicle_speed":
+            return self.convert_speed(values), f"Velocity [{self.speed_unit_label()}]"
+        if metric == "acceleration":
+            return self.convert_accel(values), f"Acceleration [{self.accel_unit_label()}]"
+        return values, "Heading error [deg]"
+
+    def heatmap_value_converter_for_metric(self, metric):
+        if metric == "speed":
+            return self.convert_speed
+        if metric == "lateral_error":
+            return self.convert_length
+        if metric == "brake":
+            if self.results.brake_pressure_reports or self.results.brake_reports:
+                return None
+            return self.convert_accel
+        return None
+
+    def brake_heatmap_unit_label(self):
+        if self.results.brake_pressure_reports:
+            return "brake pressure"
+        if self.results.brake_reports:
+            _, _, signal_name, signal_unit = brake_report_signal_arrays(self.results.brake_reports)
+            return f"{signal_name} [{signal_unit}]" if signal_unit else signal_name
+        return self.accel_unit_label()
+
+    def heatmap_units_override(self):
+        return {
+            "speed": self.speed_unit_label(),
+            "lateral_error": self.length_unit_label(),
+            "brake": self.brake_heatmap_unit_label(),
+        }
+
+    def brake_event_source_text(self):
+        if self.results.brake_pressure_reports:
+            return f"{TOPIC_BRAKE_2_REPORT} brake_pressure"
+        if self.results.brake_reports:
+            _, _, signal_name, _ = brake_report_signal_arrays(self.results.brake_reports)
+            return f"{TOPIC_BRAKE_REPORT} {signal_name}"
+        return "velocity-derived deceleration"
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2624,6 +3159,8 @@ class EvaluationGUI(QMainWindow):
             self.results.controls,
             self.results.modes,
             self.results.trajectories,
+            self.results.brake_reports,
+            self.results.brake_pressure_reports,
         ):
             times.extend([sample.t for sample in samples])
 
@@ -2642,6 +3179,8 @@ class EvaluationGUI(QMainWindow):
             self.results.controls,
             self.results.modes,
             self.results.trajectories,
+            self.results.brake_reports,
+            self.results.brake_pressure_reports,
         ):
             if samples:
                 candidate_times.append(samples[0].t)
@@ -2920,18 +3459,18 @@ class EvaluationGUI(QMainWindow):
             return
 
         stats = self.summary_stats()
-        self.set_metric_card_value("distance_total", f"{stats['distance_total']:.2f}")
-        self.set_metric_card_value("autonomous_distance", f"{stats['autonomous_distance']:.2f}")
+        self.set_metric_card_value("distance_total", self.format_length(stats["distance_total"], long_distance=True))
+        self.set_metric_card_value("autonomous_distance", self.format_length(stats["autonomous_distance"], long_distance=True))
         self.set_metric_card_value("auto_dist_pct", f"{stats['auto_dist_pct']:.1f}")
         self.set_metric_card_value("auto_time_pct", f"{stats['auto_time_pct']:.1f}")
         self.set_metric_card_value("takeover_count", f"{stats['takeover_count']}")
         self.set_metric_card_value("mode_change_count", f"{stats['mode_change_count']}")
         self.set_metric_card_value("brake_event_count", f"{stats['brake_event_count']}")
         self.set_metric_card_value("harsh_brake_count", f"{stats['harsh_brake_count']}")
-        self.set_metric_card_value("mean_lat", f"{stats['mean_lat']:.3f}")
-        self.set_metric_card_value("rms_lat", f"{stats['rms_lat']:.3f}")
-        self.set_metric_card_value("max_lat", f"{stats['max_lat']:.3f}")
-        self.set_metric_card_value("mean_vel_err", f"{stats['mean_vel_err']:.3f}")
+        self.set_metric_card_value("mean_lat", self.format_length(stats["mean_lat"]))
+        self.set_metric_card_value("rms_lat", self.format_length(stats["rms_lat"]))
+        self.set_metric_card_value("max_lat", self.format_length(stats["max_lat"]))
+        self.set_metric_card_value("mean_vel_err", self.format_speed(stats["mean_vel_err"]))
 
         if hasattr(self, "report") and self.report is not None:
             self.report.setText(self.generate_text_report())
@@ -2947,9 +3486,12 @@ class EvaluationGUI(QMainWindow):
 
         grid = QGridLayout()
         self.summary_grid = grid
+        long_distance_unit = self.length_unit_label(long_distance=True)
+        length_unit = self.length_unit_label()
+        speed_unit = self.speed_unit_label()
 
-        grid.addWidget(self.create_metric_card("Total Distance", f"{stats['distance_total']:.2f}", "m", "#E3F2FD", key="distance_total"), 0, 0)
-        grid.addWidget(self.create_metric_card("Autonomous Distance", f"{stats['autonomous_distance']:.2f}", "m", "#E8F5E9", key="autonomous_distance"), 0, 1)
+        grid.addWidget(self.create_metric_card("Total Distance", self.format_length(stats["distance_total"], long_distance=True), long_distance_unit, "#E3F2FD", key="distance_total"), 0, 0)
+        grid.addWidget(self.create_metric_card("Autonomous Distance", self.format_length(stats["autonomous_distance"], long_distance=True), long_distance_unit, "#E8F5E9", key="autonomous_distance"), 0, 1)
         grid.addWidget(self.create_metric_card("Autonomous Distance", f"{stats['auto_dist_pct']:.1f}", "%", "#C8E6C9", key="auto_dist_pct"), 0, 2)
         grid.addWidget(self.create_metric_card("Autonomous Time", f"{stats['auto_time_pct']:.1f}", "%", "#DCEDC8", key="auto_time_pct"), 0, 3)
 
@@ -2958,10 +3500,10 @@ class EvaluationGUI(QMainWindow):
         grid.addWidget(self.create_metric_card("Brake Events", f"{stats['brake_event_count']}", "", "#FFF9C4", key="brake_event_count"), 1, 2)
         grid.addWidget(self.create_metric_card("Harsh Brakes", f"{stats['harsh_brake_count']}", "", "#FFAB91", key="harsh_brake_count"), 1, 3)
 
-        grid.addWidget(self.create_metric_card("Mean Lateral Error", f"{stats['mean_lat']:.3f}", "m", "#E1F5FE", key="mean_lat"), 2, 0)
-        grid.addWidget(self.create_metric_card("RMS Lateral Error", f"{stats['rms_lat']:.3f}", "m", "#B3E5FC", key="rms_lat"), 2, 1)
-        grid.addWidget(self.create_metric_card("Max Lateral Error", f"{stats['max_lat']:.3f}", "m", "#81D4FA", key="max_lat"), 2, 2)
-        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", f"{stats['mean_vel_err']:.3f}", "m/s", "#D1C4E9", key="mean_vel_err"), 2, 3)
+        grid.addWidget(self.create_metric_card("Mean Lateral Error", self.format_length(stats["mean_lat"]), length_unit, "#E1F5FE", key="mean_lat"), 2, 0)
+        grid.addWidget(self.create_metric_card("RMS Lateral Error", self.format_length(stats["rms_lat"]), length_unit, "#B3E5FC", key="rms_lat"), 2, 1)
+        grid.addWidget(self.create_metric_card("Max Lateral Error", self.format_length(stats["max_lat"]), length_unit, "#81D4FA", key="max_lat"), 2, 2)
+        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", self.format_speed(stats["mean_vel_err"]), speed_unit, "#D1C4E9", key="mean_vel_err"), 2, 3)
 
         layout.addLayout(grid)
 
@@ -3000,49 +3542,57 @@ class EvaluationGUI(QMainWindow):
         return widget
 
     def compare_table_columns(self):
+        long_distance_unit = self.length_unit_label(long_distance=True)
+        length_unit = self.length_unit_label()
+        speed_unit = self.speed_unit_label()
+        accel_unit = self.accel_unit_label()
         return [
             ("Bag", "label", None),
             ("Storage", "storage_id", None),
-            ("Distance [m]", "distance_total_m", "{:.2f}"),
+            (f"Distance [{long_distance_unit}]", "distance_total_m", "{:.3f}" if self.use_us_units() else "{:.2f}"),
             ("Auto Dist [%]", "autonomous_distance_percent", "{:.1f}"),
             ("Auto Time [%]", "autonomous_time_percent", "{:.1f}"),
             ("Takeovers", "takeover_count", "{:.0f}"),
             ("Mode Changes", "mode_change_count", "{:.0f}"),
             ("Brake Events", "brake_event_count", "{:.0f}"),
             ("Harsh Brakes", "harsh_brake_count", "{:.0f}"),
-            ("Mean Lat [m]", "mean_lateral_error_m", "{:.3f}"),
-            ("RMS Lat [m]", "rms_lateral_error_m", "{:.3f}"),
-            ("Max Lat [m]", "max_lateral_error_m", "{:.3f}"),
-            ("Mean |Vel Err| [m/s]", "mean_abs_velocity_error_mps", "{:.3f}"),
-            ("Max |Vel Err| [m/s]", "max_abs_velocity_error_mps", "{:.3f}"),
+            (f"Mean Lat [{length_unit}]", "mean_lateral_error_m", "{:.3f}"),
+            (f"RMS Lat [{length_unit}]", "rms_lateral_error_m", "{:.3f}"),
+            (f"Max Lat [{length_unit}]", "max_lateral_error_m", "{:.3f}"),
+            (f"Mean |Vel Err| [{speed_unit}]", "mean_abs_velocity_error_mps", "{:.3f}"),
+            (f"Max |Vel Err| [{speed_unit}]", "max_abs_velocity_error_mps", "{:.3f}"),
             ("Mean |Heading| [deg]", "mean_abs_heading_error_deg", "{:.3f}"),
             ("Max |Heading| [deg]", "max_abs_heading_error_deg", "{:.3f}"),
-            ("Mean Speed [m/s]", "mean_speed_mps", "{:.3f}"),
-            ("Max Speed [m/s]", "max_speed_mps", "{:.3f}"),
-            ("Mean |Accel| [m/s^2]", "mean_abs_accel_mps2", "{:.3f}"),
-            ("Max |Accel| [m/s^2]", "max_abs_accel_mps2", "{:.3f}"),
+            (f"Mean Speed [{speed_unit}]", "mean_speed_mps", "{:.3f}"),
+            (f"Max Speed [{speed_unit}]", "max_speed_mps", "{:.3f}"),
+            (f"Mean |Accel| [{accel_unit}]", "mean_abs_accel_mps2", "{:.3f}"),
+            (f"Max |Accel| [{accel_unit}]", "max_abs_accel_mps2", "{:.3f}"),
             ("Lat Samples", "lateral_sample_count", "{:.0f}"),
             ("Vel Err Samples", "velocity_sample_count", "{:.0f}"),
             ("Path", "bag_path", None),
         ]
 
     def compare_bar_metrics(self):
+        long_distance_unit = self.length_unit_label(long_distance=True)
+        length_unit = self.length_unit_label()
+        speed_unit = self.speed_unit_label()
+        accel_unit = self.accel_unit_label()
         return [
-            ("RMS lateral error", "rms_lateral_error_m", "RMS lateral error [m]"),
-            ("Mean lateral error", "mean_lateral_error_m", "Mean lateral error [m]"),
-            ("Max lateral error", "max_lateral_error_m", "Max lateral error [m]"),
-            ("Mean abs velocity error", "mean_abs_velocity_error_mps", "Mean |velocity error| [m/s]"),
-            ("Max abs velocity error", "max_abs_velocity_error_mps", "Max |velocity error| [m/s]"),
+            ("RMS lateral error", "rms_lateral_error_m", f"RMS lateral error [{length_unit}]"),
+            ("Mean lateral error", "mean_lateral_error_m", f"Mean lateral error [{length_unit}]"),
+            ("Max lateral error", "max_lateral_error_m", f"Max lateral error [{length_unit}]"),
+            ("Mean abs velocity error", "mean_abs_velocity_error_mps", f"Mean |velocity error| [{speed_unit}]"),
+            ("Max abs velocity error", "max_abs_velocity_error_mps", f"Max |velocity error| [{speed_unit}]"),
             ("Mean abs heading error", "mean_abs_heading_error_deg", "Mean |heading error| [deg]"),
-            ("Distance", "distance_total_m", "Distance [m]"),
+            ("Distance", "distance_total_m", f"Distance [{long_distance_unit}]"),
             ("Autonomous distance", "autonomous_distance_percent", "Autonomous distance [%]"),
             ("Autonomous time", "autonomous_time_percent", "Autonomous time [%]"),
             ("Takeovers", "takeover_count", "Takeovers"),
             ("Brake events", "brake_event_count", "Brake events"),
             ("Harsh brakes", "harsh_brake_count", "Harsh brakes"),
-            ("Mean speed", "mean_speed_mps", "Mean speed [m/s]"),
-            ("Max speed", "max_speed_mps", "Max speed [m/s]"),
-            ("Mean abs acceleration", "mean_abs_accel_mps2", "Mean |acceleration| [m/s^2]"),
+            ("Mean speed", "mean_speed_mps", f"Mean speed [{speed_unit}]"),
+            ("Max speed", "max_speed_mps", f"Max speed [{speed_unit}]"),
+            ("Mean abs acceleration", "mean_abs_accel_mps2", f"Mean |acceleration| [{accel_unit}]"),
         ]
 
     def create_compare_tab(self):
@@ -3134,7 +3684,11 @@ class EvaluationGUI(QMainWindow):
 
         if self.compare_status is not None:
             count = len(self.compare_entries)
-            if count == 1:
+            if count == 0:
+                self.compare_status.setText(
+                    "Compare: no bags loaded. Select a primary bag above or add comparison bags here."
+                )
+            elif count == 1 and self.bag_path:
                 self.compare_status.setText(
                     "Compare: opened bag is the baseline. Add one or more bag folders to compare metrics."
                 )
@@ -3160,6 +3714,7 @@ class EvaluationGUI(QMainWindow):
                     text = entry.storage_id
                 else:
                     value = stats.get(key, 0.0)
+                    value = self.convert_compare_value(key, value)
                     text = fmt.format(value) if fmt is not None else str(value)
 
                 item = QTableWidgetItem(text)
@@ -3180,6 +3735,7 @@ class EvaluationGUI(QMainWindow):
 
         for entry in self.compare_entries:
             xs, ys, ylabel, title = compare_metric_series(entry.results, metric)
+            ys, ylabel = self.convert_series_values(metric, ys)
             series.append((entry.label, xs, ys))
 
         self.compare_series_canvas.plot_compare_series(
@@ -3202,7 +3758,7 @@ class EvaluationGUI(QMainWindow):
         for entry in self.compare_entries:
             stats = summarize_results_for_compare(entry.results)
             labels.append(entry.label)
-            values.append(stats.get(metric, 0.0))
+            values.append(self.convert_compare_value(metric, stats.get(metric, 0.0)))
 
         self.compare_bar_canvas.plot_compare_bars(
             labels,
@@ -3261,10 +3817,18 @@ class EvaluationGUI(QMainWindow):
             current_row = self.compare_table.currentRow()
             rows = [current_row] if current_row >= 0 else []
 
-        removable_rows = [row for row in rows if row > 0 and row < len(self.compare_entries)]
+        first_removable_row = 1 if self.bag_path else 0
+        removable_rows = [
+            row
+            for row in rows
+            if first_removable_row <= row < len(self.compare_entries)
+        ]
         if not removable_rows:
             if self.compare_status is not None:
-                self.compare_status.setText("The opened baseline bag stays pinned; select added bags to remove.")
+                if self.bag_path:
+                    self.compare_status.setText("The opened baseline bag stays pinned; select added bags to remove.")
+                else:
+                    self.compare_status.setText("Select comparison bags to remove.")
             return
 
         for row in removable_rows:
@@ -3273,10 +3837,12 @@ class EvaluationGUI(QMainWindow):
         self.update_compare_display()
 
     def clear_added_compare_bags(self):
-        if len(self.compare_entries) <= 1:
+        if self.bag_path and len(self.compare_entries) <= 1:
+            return
+        if not self.bag_path and not self.compare_entries:
             return
 
-        self.compare_entries = self.compare_entries[:1]
+        self.compare_entries = self.compare_entries[:1] if self.bag_path else []
         self.update_compare_display()
 
     def create_route_tab(self):
@@ -3518,6 +4084,10 @@ class EvaluationGUI(QMainWindow):
                 bins=bins,
                 alpha=alpha,
                 cmap=cmap,
+                value_converter=self.heatmap_value_converter_for_metric(metric),
+                metric_units_override=self.heatmap_units_override(),
+                brake_reports=self.results.brake_reports,
+                brake_pressure_reports=self.results.brake_pressure_reports,
             )
             self.heatmap_global_samples = global_samples
             self.heatmap_pose_times = np.array(
@@ -3541,10 +4111,12 @@ class EvaluationGUI(QMainWindow):
                 outlier_text = ""
                 if heatmap_stats.get("outlier_count", 0) > 0:
                     outlier_text = f", excluded {heatmap_stats['outlier_count']} outliers"
+                unit_text = self.heatmap_units_override().get(metric, "")
+                range_unit_text = f" {unit_text}" if unit_text else ""
 
                 self.heatmap_status.setText(
                     f"Rendered {metric}: {heatmap_stats['sample_count']} samples, "
-                    f"color range {heatmap_stats['vmin']:.3g} to {heatmap_stats['vmax']:.3g}"
+                    f"color range {heatmap_stats['vmin']:.3g} to {heatmap_stats['vmax']:.3g}{range_unit_text}"
                     f"{outlier_text}."
                 )
 
@@ -3575,7 +4147,7 @@ class EvaluationGUI(QMainWindow):
         if lateral:
             t0 = lateral[0][0]
             ts = [p[0] - t0 for p in lateral]
-            vals = [p[1] for p in lateral]
+            vals = [float(self.convert_length(p[1])) for p in lateral]
         else:
             t0 = None
             ts = []
@@ -3587,9 +4159,11 @@ class EvaluationGUI(QMainWindow):
             vals,
             "Lateral Tracking Error",
             "Time [s]",
-            "Lateral error [m]",
+            f"Lateral error [{self.length_unit_label()}]",
             location_mapper=self.route_location_mapper,
             time_origin=t0,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
         )
 
         if heading:
@@ -3610,6 +4184,8 @@ class EvaluationGUI(QMainWindow):
             "Heading error [deg]",
             location_mapper=self.route_location_mapper,
             time_origin=t0,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
         )
 
         self.add_plot_with_toolbar(layout, canvas1, "Lateral Tracking Error")
@@ -3626,7 +4202,7 @@ class EvaluationGUI(QMainWindow):
         if r.velocities:
             t0 = r.velocities[0].t
             ts = [v.t - t0 for v in r.velocities]
-            vs = [v.v for v in r.velocities]
+            vs = [float(self.convert_speed(v.v)) for v in r.velocities]
         else:
             t0 = None
             ts = []
@@ -3638,15 +4214,17 @@ class EvaluationGUI(QMainWindow):
             vs,
             "Actual Vehicle Velocity",
             "Time [s]",
-            "Velocity [m/s]",
+            f"Velocity [{self.speed_unit_label()}]",
             location_mapper=self.route_location_mapper,
             time_origin=t0,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
         )
 
         if r.velocity_errors:
             t0 = r.velocity_errors[0][0]
             ts_e = [p[0] - t0 for p in r.velocity_errors]
-            vals_e = [p[1] for p in r.velocity_errors]
+            vals_e = [float(self.convert_speed(p[1])) for p in r.velocity_errors]
         else:
             t0 = None
             ts_e = []
@@ -3658,9 +4236,11 @@ class EvaluationGUI(QMainWindow):
             vals_e,
             "Velocity Tracking Error",
             "Time [s]",
-            "Target - Actual [m/s]",
+            f"Target - Actual [{self.speed_unit_label()}]",
             location_mapper=self.route_location_mapper,
             time_origin=t0,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
         )
 
         self.add_plot_with_toolbar(layout, canvas1, "Actual Vehicle Velocity")
@@ -3673,6 +4253,60 @@ class EvaluationGUI(QMainWindow):
         layout = QVBoxLayout()
 
         r = self.results
+
+        if r.brake_pressure_reports:
+            t0_pressure = r.brake_pressure_reports[0].t
+            pressure_ts = [sample.t - t0_pressure for sample in r.brake_pressure_reports]
+            pressure_values = [sample.brake_pressure for sample in r.brake_pressure_reports]
+
+            pressure_canvas = PlotCanvas(width=10, height=3)
+            pressure_canvas.plot_xy(
+                pressure_ts,
+                pressure_values,
+                "Brake Pressure Report",
+                "Time [s]",
+                "Brake pressure",
+                location_mapper=self.route_location_mapper,
+                time_origin=t0_pressure,
+                location_unit_label=self.route_distance_unit_label(),
+                location_scale=self.route_distance_scale(),
+            )
+            self.add_plot_with_toolbar(layout, pressure_canvas, "Brake Pressure Report")
+
+        if r.brake_reports:
+            t0_report = r.brake_reports[0].t
+            pedal_ts = [sample.t - t0_report for sample in r.brake_reports]
+            pedal_values = [sample.pedal_output for sample in r.brake_reports]
+
+            pedal_canvas = PlotCanvas(width=10, height=3)
+            pedal_canvas.plot_xy(
+                pedal_ts,
+                pedal_values,
+                "Brake Pedal Output Report",
+                "Time [s]",
+                "Pedal output [%]",
+                location_mapper=self.route_location_mapper,
+                time_origin=t0_report,
+                location_unit_label=self.route_distance_unit_label(),
+                location_scale=self.route_distance_scale(),
+            )
+            self.add_plot_with_toolbar(layout, pedal_canvas, "Brake Pedal Output Report")
+
+            torque_values = [sample.brake_torque_actual for sample in r.brake_reports]
+            if any(np.isfinite(torque_values)):
+                torque_canvas = PlotCanvas(width=10, height=3)
+                torque_canvas.plot_xy(
+                    pedal_ts,
+                    torque_values,
+                    "Brake Torque Actual Report",
+                    "Time [s]",
+                    "Brake torque actual",
+                    location_mapper=self.route_location_mapper,
+                    time_origin=t0_report,
+                    location_unit_label=self.route_distance_unit_label(),
+                    location_scale=self.route_distance_scale(),
+                )
+                self.add_plot_with_toolbar(layout, torque_canvas, "Brake Torque Actual Report")
 
         if len(r.velocities) >= 3:
             ts = np.array([v.t for v in r.velocities])
@@ -3687,6 +4321,7 @@ class EvaluationGUI(QMainWindow):
             accel = np.zeros_like(dv)
             valid = dt > 1e-3
             accel[valid] = dv[valid] / dt[valid]
+            accel = self.convert_accel(accel)
 
             t0 = ts[0]
             t_acc = ts[1:] - t0
@@ -3701,14 +4336,26 @@ class EvaluationGUI(QMainWindow):
             accel,
             "Estimated Longitudinal Acceleration",
             "Time [s]",
-            "Acceleration [m/s²]",
+            f"Acceleration [{self.accel_unit_label()}]",
             location_mapper=self.route_location_mapper,
             time_origin=t0,
+            location_unit_label=self.route_distance_unit_label(),
+            location_scale=self.route_distance_scale(),
         )
 
         table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Start [s]", "End [s]", "Duration [s]", "Min Accel [m/s²]", "Type"])
+        self.add_plot_with_toolbar(layout, canvas, "Estimated Longitudinal Acceleration")
+
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels([
+            "Start [s]",
+            "End [s]",
+            "Duration [s]",
+            "Source",
+            "Peak Signal",
+            f"Min Accel [{self.accel_unit_label()}]",
+            "Type",
+        ])
         table.setRowCount(len(r.brake_events))
 
         if r.brake_events:
@@ -3717,13 +4364,23 @@ class EvaluationGUI(QMainWindow):
             t0 = 0.0
 
         for row, e in enumerate(r.brake_events):
+            signal_unit = f" {e.signal_unit}" if e.signal_unit else ""
+            peak_signal = "--"
+            if np.isfinite(e.peak_signal):
+                peak_signal = f"{e.peak_signal:.2f}{signal_unit}"
+
+            min_accel = "--"
+            if np.isfinite(e.min_accel):
+                min_accel = self.format_accel(e.min_accel)
+
             table.setItem(row, 0, QTableWidgetItem(f"{e.start_t - t0:.2f}"))
             table.setItem(row, 1, QTableWidgetItem(f"{e.end_t - t0:.2f}"))
             table.setItem(row, 2, QTableWidgetItem(f"{e.end_t - e.start_t:.2f}"))
-            table.setItem(row, 3, QTableWidgetItem(f"{e.min_accel:.2f}"))
-            table.setItem(row, 4, QTableWidgetItem(e.event_type))
+            table.setItem(row, 3, QTableWidgetItem(e.source))
+            table.setItem(row, 4, QTableWidgetItem(peak_signal))
+            table.setItem(row, 5, QTableWidgetItem(min_accel))
+            table.setItem(row, 6, QTableWidgetItem(e.event_type))
 
-        self.add_plot_with_toolbar(layout, canvas, "Estimated Longitudinal Acceleration")
         layout.addWidget(table)
 
         widget.setLayout(layout)
@@ -3816,6 +4473,13 @@ class EvaluationGUI(QMainWindow):
             else:
                 interval_text = f"Using {start_t - origin:.2f}s to {end_t - origin:.2f}s"
 
+        long_distance_unit = self.length_unit_label(long_distance=True)
+        length_unit = self.length_unit_label()
+        speed_unit = self.speed_unit_label()
+        rate_distance_unit = self.rate_distance_label()
+        takeover_rate = self.rate_per_display_distance(stats["takeover_count"], stats["distance_total"])
+        harsh_rate = self.rate_per_display_distance(stats["harsh_brake_count"], stats["distance_total"])
+
         text = f"""
 AUTOWARE AUTONOMOUS DRIVING EVALUATION REPORT
 
@@ -3825,8 +4489,8 @@ Selected interval:                  {interval_text}
 
 MISSION / ROUTE PERFORMANCE
 ---------------------------
-Total driven distance:              {stats['distance_total']:.2f} m
-Autonomous driven distance:         {stats['autonomous_distance']:.2f} m
+Total driven distance:              {self.format_length(stats['distance_total'], long_distance=True)} {long_distance_unit}
+Autonomous driven distance:         {self.format_length(stats['autonomous_distance'], long_distance=True)} {long_distance_unit}
 Autonomous distance percentage:     {stats['auto_dist_pct']:.2f} %
 Total evaluated time:               {stats['total_time']:.2f} s
 Autonomous time:                    {stats['autonomous_time']:.2f} s
@@ -3836,21 +4500,22 @@ INTERVENTION / HANDOVER PERFORMANCE
 -----------------------------------
 Mode change count:                  {stats['mode_change_count']}
 Takeover count:                     {stats['takeover_count']}
-Takeover rate:                      {stats['takeover_per_km']:.2f} takeovers/km
+Takeover rate:                      {takeover_rate:.2f} takeovers/{rate_distance_unit}
 
 TRAJECTORY TRACKING PERFORMANCE
 -------------------------------
-Mean lateral error:                 {stats['mean_lat']:.3f} m
-RMS lateral error:                  {stats['rms_lat']:.3f} m
-Maximum lateral error:              {stats['max_lat']:.3f} m
-Mean absolute velocity error:       {stats['mean_vel_err']:.3f} m/s
-Maximum absolute velocity error:    {stats['max_vel_err']:.3f} m/s
+Mean lateral error:                 {self.format_length(stats['mean_lat'])} {length_unit}
+RMS lateral error:                  {self.format_length(stats['rms_lat'])} {length_unit}
+Maximum lateral error:              {self.format_length(stats['max_lat'])} {length_unit}
+Mean absolute velocity error:       {self.format_speed(stats['mean_vel_err'])} {speed_unit}
+Maximum absolute velocity error:    {self.format_speed(stats['max_vel_err'])} {speed_unit}
 
 BRAKING / COMFORT PERFORMANCE
 -----------------------------
+Brake event source:                 {self.brake_event_source_text()}
 Brake event count:                  {stats['brake_event_count']}
 Harsh brake count:                  {stats['harsh_brake_count']}
-Harsh brake rate:                   {stats['harsh_per_km']:.2f} harsh brakes/km
+Harsh brake rate:                   {harsh_rate:.2f} harsh brakes/{rate_distance_unit}
 
 OUTLIER FILTERING
 -----------------
@@ -3988,12 +4653,22 @@ driver input reports, diagnostics, and stop reasons around each event.
         rows = []
 
         for event in brake_events:
+            signal_unit = f" {event.signal_unit}" if event.signal_unit else ""
+            peak_signal = "--"
+            if np.isfinite(event.peak_signal):
+                peak_signal = f"{event.peak_signal:.2f}{signal_unit}"
+
+            min_accel = "--"
+            if np.isfinite(event.min_accel):
+                min_accel = self.format_accel(event.min_accel)
+
             rows.append([
                 f"{event.start_t - t0:.2f}",
                 f"{event.end_t - t0:.2f}",
                 f"{event.end_t - event.start_t:.2f}",
-                f"{event.min_accel:.2f}",
-                f"{event.max_jerk:.2f}",
+                event.source,
+                peak_signal,
+                min_accel,
                 event.event_type,
             ])
 
@@ -4032,7 +4707,15 @@ driver input reports, diagnostics, and stop reasons around each event.
                 self.add_table_pdf_page(
                     pdf,
                     "Brake Events",
-                    ["Start [s]", "End [s]", "Duration [s]", "Min Accel [m/s^2]", "Max Jerk [m/s^3]", "Type"],
+                    [
+                        "Start [s]",
+                        "End [s]",
+                        "Duration [s]",
+                        "Source",
+                        "Peak Signal",
+                        f"Min Accel [{self.accel_unit_label()}]",
+                        "Type",
+                    ],
                     self.brake_event_rows(),
                 )
                 self.add_table_pdf_page(
@@ -4074,6 +4757,7 @@ driver input reports, diagnostics, and stop reasons around each event.
             "takeover_count": [stats["takeover_count"]],
             "mode_change_count": [stats["mode_change_count"]],
             "brake_event_count": [stats["brake_event_count"]],
+            "brake_event_source": [self.brake_event_source_text()],
             "harsh_brake_count": [stats["harsh_brake_count"]],
             "mean_lateral_error_m_filtered": [stats["mean_lat"]],
             "rms_lateral_error_m_filtered": [stats["rms_lat"]],
@@ -4115,6 +4799,10 @@ driver input reports, diagnostics, and stop reasons around each event.
                         "duration_s": e.end_t - e.start_t,
                         "min_accel_mps2": e.min_accel,
                         "max_jerk_mps3": e.max_jerk,
+                        "source": e.source,
+                        "peak_signal": e.peak_signal,
+                        "signal_name": e.signal_name,
+                        "signal_unit": e.signal_unit,
                         "type": e.event_type,
                     }
                 )
@@ -4123,6 +4811,37 @@ driver input reports, diagnostics, and stop reasons around each event.
                 os.path.join(output_dir, "brake_events.csv"),
                 index=False,
             )
+
+        if r.brake_reports:
+            pd.DataFrame(
+                [
+                    {
+                        "time_s": sample.t,
+                        "pedal_position": sample.pedal_position,
+                        "pedal_output": sample.pedal_output,
+                        "brake_torque_actual": sample.brake_torque_actual,
+                        "enabled": sample.enabled,
+                        "driver_activity": sample.driver_activity,
+                        "fault_brake_system": sample.fault_brake_system,
+                        "intervention_active": sample.intervention_active,
+                        "intervention_ready": sample.intervention_ready,
+                    }
+                    for sample in r.brake_reports
+                ]
+            ).to_csv(os.path.join(output_dir, "brake_report.csv"), index=False)
+
+        if r.brake_pressure_reports:
+            pd.DataFrame(
+                [
+                    {
+                        "time_s": sample.t,
+                        "brake_pressure": sample.brake_pressure,
+                        "estimated_road_slope": sample.estimated_road_slope,
+                        "speed_set_point": sample.speed_set_point,
+                    }
+                    for sample in r.brake_pressure_reports
+                ]
+            ).to_csv(os.path.join(output_dir, "brake_2_report.csv"), index=False)
 
         print(f"CSV report exported to: {output_dir}")
 
@@ -4133,15 +4852,30 @@ driver input reports, diagnostics, and stop reasons around each event.
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bag", required=True, help="Path to ROS 2 bag folder")
+    parser.add_argument("--bag", default=None, help="Optional path to ROS 2 bag folder")
     parser.add_argument(
         "--storage-id",
         default="sqlite3",
         help="Bag storage type: sqlite3 or mcap",
     )
-    parser.add_argument("--origin-lat", type=float, default=None, help="Optional OSM heatmap map origin latitude")
-    parser.add_argument("--origin-lon", type=float, default=None, help="Optional OSM heatmap map origin longitude")
-    parser.add_argument("--origin-yaw-deg", type=float, default=0.0, help="Optional OSM heatmap map origin yaw")
+    parser.add_argument(
+        "--origin-lat",
+        type=float,
+        default=DEFAULT_MAP_ORIGIN_LAT,
+        help="OSM heatmap map origin latitude",
+    )
+    parser.add_argument(
+        "--origin-lon",
+        type=float,
+        default=DEFAULT_MAP_ORIGIN_LON,
+        help="OSM heatmap map origin longitude",
+    )
+    parser.add_argument(
+        "--origin-yaw-deg",
+        type=float,
+        default=DEFAULT_MAP_ORIGIN_YAW_DEG,
+        help="OSM heatmap map origin yaw",
+    )
     parser.add_argument(
         "--metric",
         default="speed",
@@ -4155,21 +4889,15 @@ def main():
     parser.add_argument("--heatmap-cmap", default="jet", help="Default OSM heatmap matplotlib colormap")
 
     args = parser.parse_args()
+    app = QApplication(sys.argv)
 
     print("==============================================")
     print(" Autoware Bag Evaluation GUI")
     print("==============================================")
-    print(f"Bag path:   {args.bag}")
     print(f"Storage ID: {args.storage_id}")
-    print("Reading bag...")
+    loaded_results = EvalResults()
+    loaded_bag_path = None
 
-    evaluator = AutowareBagEvaluator(args.bag, args.storage_id)
-    evaluator.read_bag()
-
-    print("Bag analysis completed.")
-    print("Opening GUI...")
-
-    app = QApplication(sys.argv)
     heatmap_defaults = {
         "origin_lat": args.origin_lat,
         "origin_lon": args.origin_lon,
@@ -4181,9 +4909,27 @@ def main():
         "alpha": args.heatmap_alpha,
         "cmap": args.heatmap_cmap,
     }
+
+    if args.bag:
+        print(f"Bag path:   {args.bag}")
+        print("Reading bag...")
+
+        try:
+            evaluator = AutowareBagEvaluator(args.bag, args.storage_id)
+            evaluator.read_bag()
+            loaded_results = evaluator.results
+            loaded_bag_path = args.bag
+            print("Bag analysis completed.")
+        except Exception as exc:
+            print(f"Could not read initial bag: {exc}")
+            QMessageBox.warning(None, "Bag Load Error", str(exc))
+    else:
+        print("No initial bag path provided. Opening GUI for bag selection.")
+
+    print("Opening GUI...")
     gui = EvaluationGUI(
-        evaluator.results,
-        args.bag,
+        loaded_results,
+        loaded_bag_path,
         storage_id=args.storage_id,
         heatmap_defaults=heatmap_defaults,
     )
