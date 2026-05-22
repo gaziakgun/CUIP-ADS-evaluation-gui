@@ -48,6 +48,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QSpinBox,
     QDoubleSpinBox,
+    QSlider,
     QMessageBox,
     QSizePolicy,
     QTextEdit,
@@ -66,6 +67,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.widgets import SpanSelector
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
@@ -97,6 +99,9 @@ EVALUATION_TOPICS = {
     TOPIC_OPERATION_MODE,
     TOPIC_STOP_REASONS,
 }
+
+OUTLIER_MAD_THRESHOLD = 5.0
+OUTLIER_MIN_SAMPLES = 10
 
 
 # ============================================================
@@ -759,6 +764,43 @@ def compute_mode_stats(modes):
     return mode_change_count, takeover_count, autonomous_time, total_time
 
 
+def compute_mode_stats_for_interval(modes, start_t, end_t):
+    if start_t is None or end_t is None or end_t <= start_t:
+        return 0, 0, 0.0, 0.0
+    if not modes:
+        return 0, 0, 0.0, end_t - start_t
+
+    mode_times = sample_times(modes)
+    previous_mode = get_mode_at_time(modes, start_t, mode_times)
+    previous_t = start_t
+    mode_change_count = 0
+    takeover_count = 0
+    autonomous_time = 0.0
+
+    for mode in modes:
+        if mode.t <= start_t:
+            continue
+        if mode.t > end_t:
+            break
+
+        dt = mode.t - previous_t
+        if previous_mode == "AUTONOMOUS":
+            autonomous_time += max(0.0, dt)
+
+        if mode.mode != previous_mode:
+            mode_change_count += 1
+            if previous_mode == "AUTONOMOUS" and mode.mode != "AUTONOMOUS":
+                takeover_count += 1
+
+        previous_mode = mode.mode
+        previous_t = mode.t
+
+    if previous_mode == "AUTONOMOUS":
+        autonomous_time += max(0.0, end_t - previous_t)
+
+    return mode_change_count, takeover_count, autonomous_time, end_t - start_t
+
+
 def compute_brake_events(velocities, accel_threshold=-0.5, harsh_threshold=-3.0):
     """
     Brake event detection from velocity derivative.
@@ -919,6 +961,113 @@ def robust_norm(data, metric):
     return Normalize(vmin=vmin, vmax=vmax), vmin, vmax
 
 
+def robust_center_scale(values):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+
+    finite_values = values[finite]
+    if len(finite_values) == 0:
+        return 0.0, 0.0
+
+    median = float(np.median(finite_values))
+    deviations = np.abs(finite_values - median)
+    mad = float(np.median(deviations))
+
+    if mad > 1e-9:
+        return median, 1.4826 * mad
+
+    q1, q3 = np.percentile(finite_values, [25.0, 75.0])
+    iqr = float(q3 - q1)
+    if iqr > 1e-9:
+        return median, iqr / 1.349
+
+    return median, 0.0
+
+
+def robust_outlier_mask(values, threshold=OUTLIER_MAD_THRESHOLD, min_samples=OUTLIER_MIN_SAMPLES):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    mask = finite.copy()
+
+    finite_count = int(np.count_nonzero(finite))
+    if finite_count < min_samples:
+        return mask
+
+    median, robust_sigma = robust_center_scale(values)
+    if robust_sigma <= 1e-9:
+        return mask
+
+    mask[finite] = np.abs(values[finite] - median) <= threshold * robust_sigma
+    return mask
+
+
+def isolated_spike_mask(values, threshold=OUTLIER_MAD_THRESHOLD, min_samples=OUTLIER_MIN_SAMPLES):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    keep = finite.copy()
+
+    if int(np.count_nonzero(finite)) < min_samples:
+        return keep
+
+    median, robust_sigma = robust_center_scale(values)
+    if robust_sigma <= 1e-9:
+        return keep
+
+    extreme = finite & (np.abs(values - median) > threshold * robust_sigma)
+    finite_indices = np.flatnonzero(finite)
+    jump_threshold = max(2.0 * robust_sigma, 1e-9)
+
+    for position, idx in enumerate(finite_indices):
+        if not extreme[idx]:
+            continue
+        if position == 0 or position == len(finite_indices) - 1:
+            continue
+
+        prev_idx = finite_indices[position - 1]
+        next_idx = finite_indices[position + 1]
+
+        if extreme[prev_idx] or extreme[next_idx]:
+            continue
+
+        prev_value = values[prev_idx]
+        value = values[idx]
+        next_value = values[next_idx]
+
+        jumps_away_from_neighbors = (
+            abs(value - prev_value) > jump_threshold
+            and abs(value - next_value) > jump_threshold
+        )
+        neighbors_are_consistent = abs(prev_value - next_value) <= jump_threshold
+
+        if jumps_away_from_neighbors and neighbors_are_consistent:
+            keep[idx] = False
+
+    return keep
+
+
+def filter_outliers(values):
+    values = np.asarray(values, dtype=float)
+    return values[isolated_spike_mask(values)]
+
+
+def filter_sample_pairs(data):
+    if not data:
+        return []
+
+    values = np.array([p[1] for p in data], dtype=float)
+    mask = isolated_spike_mask(values)
+    return [point for point, keep in zip(data, mask) if keep]
+
+
+def outlier_count(data):
+    if not data:
+        return 0
+
+    values = np.array([p[1] for p in data], dtype=float)
+    mask = isolated_spike_mask(values)
+    return int(len(values) - np.count_nonzero(mask))
+
+
 def sample_grid_values(xs, ys, heat, extent):
     xmin, xmax, ymin, ymax = extent
     bins_x, bins_y = heat.shape
@@ -982,6 +1131,7 @@ def create_heatmap_values(global_samples, velocities, trajectories, metric, mode
     xs = []
     ys = []
     values = []
+    times = []
 
     for sample in global_samples:
         pose = sample["pose"]
@@ -1028,8 +1178,22 @@ def create_heatmap_values(global_samples, velocities, trajectories, metric, mode
         xs.append(sample["mx"])
         ys.append(sample["my"])
         values.append(value)
+        times.append(pose.t)
 
-    return np.array(xs), np.array(ys), np.array(values)
+    xs = np.array(xs)
+    ys = np.array(ys)
+    values = np.array(values)
+    times = np.array(times)
+    removed_outliers = 0
+
+    if metric in ("speed", "lateral_error", "brake") and len(values) > 0:
+        mask = isolated_spike_mask(values)
+        removed_outliers = int(len(values) - np.count_nonzero(mask))
+        xs = xs[mask]
+        ys = ys[mask]
+        values = values[mask]
+
+    return xs, ys, values, removed_outliers
 
 
 def draw_osm_heatmap(
@@ -1045,7 +1209,7 @@ def draw_osm_heatmap(
     alpha=0.65,
     cmap="jet",
 ):
-    xs, ys, values = create_heatmap_values(
+    xs, ys, values, removed_outliers = create_heatmap_values(
         global_samples,
         velocities,
         trajectories,
@@ -1186,6 +1350,7 @@ def draw_osm_heatmap(
     fig.tight_layout()
     return {
         "sample_count": len(xs),
+        "outlier_count": removed_outliers,
         "vmin": vmin,
         "vmax": vmax,
     }
@@ -1355,6 +1520,13 @@ class PlotCanvas(FigureCanvas):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         self.ax = self.fig.add_subplot(111)
         self.has_y_scale_controls = False
+        self.has_time_cursor = False
+        self.time_origin = None
+        self.time_cursor_min = None
+        self.time_cursor_max = None
+        self.time_cursor_line = None
+        self.interval_patch = None
+        self.span_selector = None
         self.location_axis = None
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -1366,6 +1538,9 @@ class PlotCanvas(FigureCanvas):
     def plot_xy(self, x, y, title, xlabel, ylabel, location_mapper=None, time_origin=None):
         self.clear_location_axis()
         self.ax.clear()
+        self.has_time_cursor = False
+        self.time_cursor_line = None
+        self.interval_patch = None
         self.ax.plot(x, y, linewidth=2)
         self.ax.set_title(title)
         self.ax.set_xlabel(xlabel)
@@ -1374,6 +1549,7 @@ class PlotCanvas(FigureCanvas):
         self.add_location_axis(location_mapper, time_origin)
         self.has_y_scale_controls = True
         self.apply_robust_y_scale()
+        self.configure_time_cursor(x, time_origin)
         self.fig.tight_layout()
         self.draw()
 
@@ -1411,6 +1587,9 @@ class PlotCanvas(FigureCanvas):
         ys = []
 
         for line in self.ax.get_lines():
+            if getattr(line, "_is_time_cursor", False):
+                continue
+
             x_data = np.asarray(line.get_xdata(), dtype=float)
             y_data = np.asarray(line.get_ydata(), dtype=float)
 
@@ -1467,9 +1646,118 @@ class PlotCanvas(FigureCanvas):
     def apply_full_y_scale(self):
         self.set_y_limits_from_values(self.visible_y_values(), robust=False)
 
+    def configure_time_cursor(self, x_values, time_origin):
+        if time_origin is None:
+            return
+
+        x_values = np.asarray(x_values, dtype=float)
+        finite = x_values[np.isfinite(x_values)]
+        if len(finite) == 0:
+            return
+
+        self.time_origin = float(time_origin)
+        self.time_cursor_min = self.time_origin + float(np.min(finite))
+        self.time_cursor_max = self.time_origin + float(np.max(finite))
+        self.has_time_cursor = self.time_cursor_max >= self.time_cursor_min
+
+        self.time_cursor_line = self.ax.axvline(
+            finite[0],
+            color="#FFC107",
+            linewidth=2.0,
+            linestyle="--",
+            alpha=0.95,
+            zorder=20,
+        )
+        self.time_cursor_line._is_time_cursor = True
+        self.time_cursor_line.set_visible(False)
+
+    def set_time_cursor(self, selected_time, keep_visible=False):
+        if not self.has_time_cursor or self.time_cursor_line is None:
+            return
+
+        if selected_time is None or not np.isfinite(selected_time):
+            self.time_cursor_line.set_visible(False)
+            self.draw_idle()
+            return
+
+        selected_time = float(selected_time)
+        in_range = self.time_cursor_min <= selected_time <= self.time_cursor_max
+        self.time_cursor_line.set_visible(in_range)
+
+        if in_range:
+            cursor_x = selected_time - self.time_origin
+            self.time_cursor_line.set_xdata([cursor_x, cursor_x])
+            if keep_visible:
+                self.keep_time_cursor_visible(cursor_x)
+
+        self.draw_idle()
+
+    def keep_time_cursor_visible(self, cursor_x, margin_fraction=0.15):
+        x_min, x_max = self.ax.get_xlim()
+        if x_max <= x_min:
+            return
+
+        span = x_max - x_min
+        data_min = self.time_cursor_min - self.time_origin
+        data_max = self.time_cursor_max - self.time_origin
+        if data_max <= data_min:
+            return
+
+        margin = span * margin_fraction
+        shift = 0.0
+        if cursor_x < x_min + margin:
+            shift = cursor_x - (x_min + margin)
+        elif cursor_x > x_max - margin:
+            shift = cursor_x - (x_max - margin)
+
+        if abs(shift) <= 1e-9:
+            return
+
+        new_min = x_min + shift
+        new_max = x_max + shift
+
+        if span < data_max - data_min:
+            if new_min < data_min:
+                new_min = data_min
+                new_max = data_min + span
+            if new_max > data_max:
+                new_max = data_max
+                new_min = data_max - span
+
+        self.ax.set_xlim(new_min, new_max)
+
+    def set_analysis_interval(self, interval, mode="include"):
+        if self.interval_patch is not None:
+            try:
+                self.interval_patch.remove()
+            except (KeyError, ValueError):
+                pass
+            self.interval_patch = None
+
+        if interval is None or self.time_origin is None:
+            self.draw_idle()
+            return
+
+        start_t, end_t = interval
+        start_x = start_t - self.time_origin
+        end_x = end_t - self.time_origin
+        color = "#C62828" if mode == "exclude" else "#1976D2"
+        alpha = 0.22 if mode == "exclude" else 0.16
+        self.interval_patch = self.ax.axvspan(
+            start_x,
+            end_x,
+            color=color,
+            alpha=alpha,
+            zorder=1,
+        )
+        self.draw_idle()
+
     def plot_route(self, poses, modes):
         self.ax.clear()
         self.has_y_scale_controls = False
+        self.has_time_cursor = False
+        self.time_cursor_line = None
+        self.interval_patch = None
 
         if len(poses) < 2:
             self.ax.set_title("Route")
@@ -1517,12 +1805,26 @@ class EvaluationGUI(QMainWindow):
         self.heatmap_defaults = heatmap_defaults or {}
         self.route_location_mapper = RouteLocationMapper(self.results.poses)
         self.metric_cards = []
+        self.metric_card_values = {}
+        self.analysis_interval = None
+        self.analysis_interval_mode = "include"
+        self.analysis_interval_status = None
         self.plot_canvases = []
         self.plot_entries = []
+        self.time_scroll_controls = []
+        self.selected_time = None
+        self._syncing_time_scrolls = False
+        self.heatmap_global_samples = []
+        self.heatmap_pose_times = np.array([])
         self.heatmap_fig = None
         self.heatmap_canvas = None
+        self.heatmap_marker = None
+        self.heatmap_marker_label = None
+        self.heatmap_time_scroll = None
+        self.heatmap_time_label = None
         self.heatmap_save_button = None
         self.heatmap_status = None
+        self.time_cursor_status = None
         self._last_style_scale = None
 
         self.setWindowTitle("Autoware Autonomous Driving Evaluation Dashboard")
@@ -1675,8 +1977,14 @@ class EvaluationGUI(QMainWindow):
                 f"font-size: {control_px}px; color: #455A64; padding: {int(2 * scale)}px;"
             )
 
+        if hasattr(self, "time_cursor_status") and self.time_cursor_status is not None:
+            self.time_cursor_status.setMaximumHeight(int(36 * scale))
+            self.time_cursor_status.setStyleSheet(
+                f"font-size: {control_px}px; color: #263238; padding: {int(2 * scale)}px;"
+            )
+
         if hasattr(self, "heatmap_control_panel"):
-            self.heatmap_control_panel.setMaximumHeight(int(190 * scale))
+            self.heatmap_control_panel.setMaximumHeight(int(255 * scale))
 
         plot_title_px = int(13 * scale)
         plot_label_px = int(10 * scale)
@@ -1706,7 +2014,7 @@ class EvaluationGUI(QMainWindow):
             figure.tight_layout()
             canvas.draw_idle()
 
-    def create_metric_card(self, name, value, unit="", color="#ECEFF1"):
+    def create_metric_card(self, name, value, unit="", color="#ECEFF1", key=None):
         widget = QWidget()
         layout = QVBoxLayout()
 
@@ -1721,8 +2029,19 @@ class EvaluationGUI(QMainWindow):
 
         widget.setLayout(layout)
         self.metric_cards.append((widget, label_name, label_value, layout, color))
+        if key is not None:
+            self.metric_card_values[key] = (label_value, unit)
 
         return widget
+
+    def set_metric_card_value(self, key, value):
+        entry = self.metric_card_values.get(key)
+        if entry is None:
+            return
+
+        label_value, unit = entry
+        suffix = f" {unit}" if unit else " "
+        label_value.setText(f"{value}{suffix}")
 
     def add_plot_with_toolbar(self, layout, canvas, title=None, stretch=1):
         toolbar = NavigationToolbar(canvas, self)
@@ -1764,6 +2083,41 @@ class EvaluationGUI(QMainWindow):
             toolbar_layout.addWidget(robust_button)
             toolbar_layout.addWidget(full_button)
 
+        if getattr(canvas, "has_time_cursor", False):
+            time_label = QLabel("Time --")
+            time_label.setMinimumWidth(95)
+            time_label.setToolTip("Selected time on this plot.")
+
+            time_scroll = QSlider(Qt.Horizontal)
+            time_scroll.setRange(0, 10000)
+            time_scroll.setSingleStep(10)
+            time_scroll.setPageStep(250)
+            time_scroll.setMinimumWidth(180)
+            time_scroll.setToolTip(
+                "Scroll through this graph's X axis. The yellow graph cursor and heatmap marker follow this time."
+            )
+            time_scroll.valueChanged.connect(
+                lambda value, c=canvas: self.on_time_scroll_changed(c, value)
+            )
+
+            toolbar_layout.addWidget(QLabel("Time Scroll"))
+            toolbar_layout.addWidget(time_scroll, 1)
+            toolbar_layout.addWidget(time_label)
+            self.register_time_scroll(canvas, time_scroll, time_label)
+            self.register_interval_selector(canvas)
+
+            clear_interval_button = QPushButton("Clear Interval")
+            clear_interval_button.setToolTip("Clear the selected analysis time interval.")
+            clear_interval_button.clicked.connect(self.clear_analysis_interval)
+            toolbar_layout.addWidget(clear_interval_button)
+
+            exclude_interval_button = QPushButton("Exclude Interval")
+            exclude_interval_button.setToolTip(
+                "Exclude the selected interval from calculations and use the unselected data."
+            )
+            exclude_interval_button.clicked.connect(self.exclude_analysis_interval)
+            toolbar_layout.addWidget(exclude_interval_button)
+
         save_button = QPushButton("Save Figure")
         save_button.clicked.connect(
             lambda checked=False, c=canvas, t=title: self.save_figure_dialog(c, t)
@@ -1773,11 +2127,359 @@ class EvaluationGUI(QMainWindow):
         layout.addLayout(toolbar_layout)
         layout.addWidget(canvas, stretch)
 
+    def register_interval_selector(self, canvas):
+        if not getattr(canvas, "has_time_cursor", False):
+            return
+        if getattr(canvas, "span_selector", None) is not None:
+            return
+
+        callback = lambda start_x, end_x, c=canvas: self.on_plot_interval_selected(c, start_x, end_x)
+        selector_kwargs = {
+            "useblit": True,
+            "button": 1,
+            "minspan": 0.05,
+            "interactive": True,
+        }
+        fallback_selector_kwargs = {
+            "useblit": True,
+            "button": 1,
+            "minspan": 0.05,
+        }
+
+        try:
+            canvas.span_selector = SpanSelector(
+                canvas.ax,
+                callback,
+                "horizontal",
+                props={"facecolor": "#1976D2", "alpha": 0.18},
+                **selector_kwargs,
+            )
+        except TypeError:
+            canvas.span_selector = SpanSelector(
+                canvas.ax,
+                callback,
+                "horizontal",
+                rectprops={"facecolor": "#1976D2", "alpha": 0.18},
+                **fallback_selector_kwargs,
+            )
+
+    def on_plot_interval_selected(self, canvas, start_x, end_x):
+        if canvas.time_origin is None:
+            return
+
+        start_t = canvas.time_origin + min(start_x, end_x)
+        end_t = canvas.time_origin + max(start_x, end_x)
+        self.set_analysis_interval(start_t, end_t)
+
+    def set_analysis_interval(self, start_t, end_t):
+        if start_t is None or end_t is None:
+            return
+
+        start_t, end_t = sorted((float(start_t), float(end_t)))
+        route_start, route_end = self.route_time_range()
+        if route_start is not None and route_end is not None:
+            start_t = max(start_t, route_start)
+            end_t = min(end_t, route_end)
+
+        if end_t <= start_t:
+            return
+
+        self.analysis_interval = (start_t, end_t)
+        self.analysis_interval_mode = "include"
+        self.update_analysis_interval_visuals()
+        self.update_summary_display()
+
+    def exclude_analysis_interval(self, checked=False):
+        if self.analysis_interval is None:
+            return
+
+        self.analysis_interval_mode = "exclude"
+        self.update_analysis_interval_visuals()
+        self.update_summary_display()
+
+    def clear_analysis_interval(self, checked=False):
+        self.analysis_interval = None
+        self.analysis_interval_mode = "include"
+        self.update_analysis_interval_visuals()
+        self.update_summary_display()
+
+    def update_analysis_interval_visuals(self):
+        for canvas in self.plot_canvases:
+            if hasattr(canvas, "set_analysis_interval"):
+                canvas.set_analysis_interval(self.analysis_interval, self.analysis_interval_mode)
+
+        if self.analysis_interval_status is not None:
+            self.analysis_interval_status.setText(self.analysis_interval_text())
+
+    def analysis_interval_text(self):
+        if self.analysis_interval is None:
+            return "Analysis interval: full route. Drag across any time-series graph to calculate only that time window."
+
+        start_t, end_t = self.analysis_interval
+        origin = self.route_time_origin()
+        if self.analysis_interval_mode == "exclude":
+            prefix = "Excluded interval"
+            suffix = "calculating outside the red interval"
+        else:
+            prefix = "Analysis interval"
+            suffix = "calculating inside the blue interval"
+
+        return (
+            f"{prefix}: "
+            f"{start_t - origin:.2f}s to {end_t - origin:.2f}s "
+            f"({end_t - start_t:.2f}s duration); {suffix}."
+        )
+
     def figure_for_canvas(self, canvas):
         figure = getattr(canvas, "fig", None)
         if figure is None:
             figure = getattr(canvas, "figure", None)
         return figure
+
+    def register_time_scroll(self, canvas, time_scroll, time_label):
+        self.time_scroll_controls.append(
+            {
+                "canvas": canvas,
+                "scroll": time_scroll,
+                "label": time_label,
+            }
+        )
+        self.sync_time_scroll_controls()
+
+    def on_time_scroll_changed(self, canvas, value):
+        if self._syncing_time_scrolls:
+            return
+
+        selected_time = self.time_from_scroll_value(canvas, value)
+        if selected_time is None:
+            return
+
+        self.set_selected_time(selected_time, keep_plots_visible=True)
+
+    def time_from_scroll_value(self, canvas, value):
+        if not getattr(canvas, "has_time_cursor", False):
+            return None
+
+        t_min = canvas.time_cursor_min
+        t_max = canvas.time_cursor_max
+        if t_min is None or t_max is None or t_max < t_min:
+            return None
+
+        fraction = float(value) / 10000.0
+        return t_min + (t_max - t_min) * fraction
+
+    def scroll_value_from_time(self, canvas, selected_time):
+        if selected_time is None or not getattr(canvas, "has_time_cursor", False):
+            return 0
+
+        t_min = canvas.time_cursor_min
+        t_max = canvas.time_cursor_max
+        if t_min is None or t_max is None or t_max <= t_min:
+            return 0
+
+        fraction = (float(selected_time) - t_min) / (t_max - t_min)
+        fraction = max(0.0, min(1.0, fraction))
+        return int(round(fraction * 10000.0))
+
+    def set_selected_time(self, selected_time, keep_plots_visible=False):
+        if selected_time is None or not np.isfinite(selected_time):
+            return
+
+        self.selected_time = float(selected_time)
+
+        for canvas in self.plot_canvases:
+            if hasattr(canvas, "set_time_cursor"):
+                canvas.set_time_cursor(self.selected_time, keep_visible=keep_plots_visible)
+
+        self.sync_time_scroll_controls()
+        self.update_heatmap_time_marker()
+
+    def sync_time_scroll_controls(self):
+        if not hasattr(self, "time_scroll_controls"):
+            return
+
+        self._syncing_time_scrolls = True
+        try:
+            if self.heatmap_time_scroll is not None and self.heatmap_time_label is not None:
+                if self.selected_time is None:
+                    self.heatmap_time_label.setText("Time --")
+                else:
+                    self.heatmap_time_scroll.setValue(
+                        self.route_scroll_value_from_time(self.selected_time)
+                    )
+                    route_t = self.selected_time - self.route_time_origin()
+                    self.heatmap_time_label.setText(f"{route_t:.2f} s")
+
+            for entry in self.time_scroll_controls:
+                canvas = entry["canvas"]
+                time_scroll = entry["scroll"]
+                time_label = entry["label"]
+
+                if self.selected_time is None:
+                    time_label.setText("Time --")
+                    continue
+
+                time_scroll.setValue(self.scroll_value_from_time(canvas, self.selected_time))
+                rel_time = self.selected_time - canvas.time_origin
+                in_range = canvas.time_cursor_min <= self.selected_time <= canvas.time_cursor_max
+                if in_range:
+                    time_label.setText(f"{rel_time:.2f} s")
+                else:
+                    time_label.setText("outside")
+        finally:
+            self._syncing_time_scrolls = False
+
+    def route_time_range(self):
+        if self.results.poses:
+            return self.results.poses[0].t, self.results.poses[-1].t
+
+        times = []
+        for samples in (
+            self.results.velocities,
+            self.results.controls,
+            self.results.modes,
+            self.results.trajectories,
+        ):
+            times.extend([sample.t for sample in samples])
+
+        if not times:
+            return None, None
+
+        return min(times), max(times)
+
+    def route_time_origin(self):
+        if self.results.poses:
+            return self.results.poses[0].t
+
+        candidate_times = []
+        for samples in (
+            self.results.velocities,
+            self.results.controls,
+            self.results.modes,
+            self.results.trajectories,
+        ):
+            if samples:
+                candidate_times.append(samples[0].t)
+
+        return min(candidate_times) if candidate_times else 0.0
+
+    def time_from_route_scroll_value(self, value):
+        t_min, t_max = self.route_time_range()
+        if t_min is None or t_max is None:
+            return None
+        if t_max <= t_min:
+            return t_min
+
+        fraction = float(value) / 10000.0
+        return t_min + (t_max - t_min) * fraction
+
+    def route_scroll_value_from_time(self, selected_time):
+        t_min, t_max = self.route_time_range()
+        if selected_time is None or t_min is None or t_max is None or t_max <= t_min:
+            return 0
+
+        fraction = (float(selected_time) - t_min) / (t_max - t_min)
+        fraction = max(0.0, min(1.0, fraction))
+        return int(round(fraction * 10000.0))
+
+    def on_route_time_scroll_changed(self, value):
+        if self._syncing_time_scrolls:
+            return
+
+        selected_time = self.time_from_route_scroll_value(value)
+        if selected_time is None:
+            return
+
+        self.set_selected_time(selected_time, keep_plots_visible=True)
+
+    def set_time_cursor_status(self, sample=None):
+        if self.time_cursor_status is None:
+            return
+
+        if self.selected_time is None:
+            self.time_cursor_status.setText(
+                "Time cursor: use a graph's Time Scroll to inspect the matching route point."
+            )
+            return
+
+        route_t = self.selected_time - self.route_time_origin()
+        if sample is None:
+            self.time_cursor_status.setText(
+                f"Time cursor: {route_t:.2f} s from route start. Generate the heatmap to show the map marker."
+            )
+            return
+
+        pose = sample["pose"]
+        pose_route_t = pose.t - self.route_time_origin()
+        distance_text = ""
+        if self.route_location_mapper.available:
+            distance = float(self.route_location_mapper.time_to_distance(np.array([pose.t]))[0])
+            distance_text = f", distance {distance:.1f} m"
+
+        self.time_cursor_status.setText(
+            f"Time cursor: {route_t:.2f} s from route start; "
+            f"nearest pose {pose_route_t:.2f} s{distance_text}, "
+            f"lat {sample['lat']:.7f}, lon {sample['lon']:.7f}."
+        )
+
+    def update_heatmap_time_marker(self):
+        if (
+            self.selected_time is None
+            or self.heatmap_canvas is None
+            or not self.heatmap_global_samples
+            or len(self.heatmap_pose_times) == 0
+        ):
+            self.set_time_cursor_status(sample=None)
+            return
+
+        idx = nearest_time_index(self.heatmap_pose_times, self.selected_time)
+        if idx is None:
+            self.set_time_cursor_status(sample=None)
+            return
+
+        sample = self.heatmap_global_samples[idx]
+        ax = self.heatmap_fig.axes[0] if self.heatmap_fig is not None and self.heatmap_fig.axes else None
+        if ax is None:
+            self.set_time_cursor_status(sample=None)
+            return
+
+        if self.heatmap_marker is None or self.heatmap_marker.axes is None:
+            self.heatmap_marker = ax.scatter(
+                sample["mx"],
+                sample["my"],
+                s=190,
+                marker="o",
+                facecolors="none",
+                edgecolors="#FFC107",
+                linewidths=3.0,
+                label="Selected time",
+                zorder=30,
+            )
+        else:
+            self.heatmap_marker.set_offsets([[sample["mx"], sample["my"]]])
+            self.heatmap_marker.set_visible(True)
+
+        label_text = f"{sample['pose'].t - self.route_time_origin():.2f}s"
+        if self.heatmap_marker_label is None or self.heatmap_marker_label.axes is None:
+            self.heatmap_marker_label = ax.text(
+                sample["mx"],
+                sample["my"],
+                label_text,
+                color="black",
+                fontsize=9,
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": "#FFC107", "edgecolor": "black", "alpha": 0.9},
+                zorder=31,
+            )
+        else:
+            self.heatmap_marker_label.set_position((sample["mx"], sample["my"]))
+            self.heatmap_marker_label.set_text(label_text)
+            self.heatmap_marker_label.set_visible(True)
+
+        self.set_time_cursor_status(sample=sample)
+        self.heatmap_canvas.draw_idle()
 
     def save_figure_dialog(self, canvas, title="figure", default_path=None):
         figure = self.figure_for_canvas(canvas)
@@ -1804,46 +2506,191 @@ class EvaluationGUI(QMainWindow):
 
         figure.savefig(output_path, dpi=200, bbox_inches="tight")
 
-    def create_summary_tab(self):
+    def time_pairs_in_interval(self, data):
+        if not data or self.analysis_interval is None:
+            return data
+
+        start_t, end_t = self.analysis_interval
+        if self.analysis_interval_mode == "exclude":
+            return [point for point in data if point[0] < start_t or point[0] > end_t]
+
+        return [point for point in data if start_t <= point[0] <= end_t]
+
+    def samples_in_interval(self, samples):
+        if not samples or self.analysis_interval is None:
+            return samples
+
+        start_t, end_t = self.analysis_interval
+        if self.analysis_interval_mode == "exclude":
+            return [sample for sample in samples if sample.t < start_t or sample.t > end_t]
+
+        return [sample for sample in samples if start_t <= sample.t <= end_t]
+
+    def brake_events_in_interval(self):
+        if self.analysis_interval is None:
+            return self.results.brake_events
+
+        start_t, end_t = self.analysis_interval
+        if self.analysis_interval_mode == "exclude":
+            return [
+                event
+                for event in self.results.brake_events
+                if event.end_t < start_t or event.start_t > end_t
+            ]
+
+        return [
+            event
+            for event in self.results.brake_events
+            if event.end_t >= start_t and event.start_t <= end_t
+        ]
+
+    def summary_stats(self):
         r = self.results
+
+        if self.analysis_interval is None:
+            distance_total = r.distance_total
+            autonomous_distance = r.autonomous_distance
+            mode_change_count = r.mode_change_count
+            takeover_count = r.takeover_count
+            autonomous_time = r.autonomous_time
+            total_time = r.total_time
+        elif self.analysis_interval_mode == "exclude":
+            start_t, end_t = self.analysis_interval
+            poses = self.samples_in_interval(r.poses)
+            interval_duration = end_t - start_t
+            (
+                interval_mode_change_count,
+                interval_takeover_count,
+                interval_autonomous_time,
+                _,
+            ) = compute_mode_stats_for_interval(r.modes, start_t, end_t)
+
+            distance_total = compute_distance(poses)
+            autonomous_distance = compute_autonomous_distance(poses, r.modes)
+            mode_change_count = max(0, r.mode_change_count - interval_mode_change_count)
+            takeover_count = max(0, r.takeover_count - interval_takeover_count)
+            autonomous_time = max(0.0, r.autonomous_time - interval_autonomous_time)
+            total_time = max(0.0, r.total_time - interval_duration)
+        else:
+            start_t, end_t = self.analysis_interval
+            poses = self.samples_in_interval(r.poses)
+            distance_total = compute_distance(poses)
+            autonomous_distance = compute_autonomous_distance(poses, r.modes)
+            (
+                mode_change_count,
+                takeover_count,
+                autonomous_time,
+                total_time,
+            ) = compute_mode_stats_for_interval(r.modes, start_t, end_t)
+
+        brake_events = self.brake_events_in_interval()
+        harsh_brake_count = sum(1 for event in brake_events if event.event_type == "HARSH")
+
+        lateral_errors = self.time_pairs_in_interval(r.lateral_errors)
+        velocity_errors = self.time_pairs_in_interval(r.velocity_errors)
+
+        auto_dist_pct = 0.0
+        if distance_total > 1e-6:
+            auto_dist_pct = 100.0 * autonomous_distance / distance_total
+
+        auto_time_pct = 0.0
+        if total_time > 1e-6:
+            auto_time_pct = 100.0 * autonomous_time / total_time
+
+        takeover_per_km = 0.0
+        if distance_total > 1e-6:
+            takeover_per_km = takeover_count / (distance_total / 1000.0)
+
+        harsh_per_km = 0.0
+        if distance_total > 1e-6:
+            harsh_per_km = harsh_brake_count / (distance_total / 1000.0)
+
+        return {
+            "distance_total": distance_total,
+            "autonomous_distance": autonomous_distance,
+            "auto_dist_pct": auto_dist_pct,
+            "total_time": total_time,
+            "autonomous_time": autonomous_time,
+            "auto_time_pct": auto_time_pct,
+            "mode_change_count": mode_change_count,
+            "takeover_count": takeover_count,
+            "takeover_per_km": takeover_per_km,
+            "brake_events": brake_events,
+            "brake_event_count": len(brake_events),
+            "harsh_brake_count": harsh_brake_count,
+            "harsh_per_km": harsh_per_km,
+            "mean_lat": self.mean_value(lateral_errors),
+            "rms_lat": self.rms_value(lateral_errors),
+            "max_lat": self.max_value(lateral_errors),
+            "mean_vel_err": self.mean_abs_value(velocity_errors),
+            "max_vel_err": self.max_abs_value(velocity_errors),
+            "lateral_outliers": outlier_count(lateral_errors),
+            "velocity_outliers": outlier_count(velocity_errors),
+            "lateral_sample_count": len(lateral_errors),
+            "velocity_sample_count": len(velocity_errors),
+        }
+
+    def update_summary_display(self):
+        if not self.metric_card_values:
+            return
+
+        stats = self.summary_stats()
+        self.set_metric_card_value("distance_total", f"{stats['distance_total']:.2f}")
+        self.set_metric_card_value("autonomous_distance", f"{stats['autonomous_distance']:.2f}")
+        self.set_metric_card_value("auto_dist_pct", f"{stats['auto_dist_pct']:.1f}")
+        self.set_metric_card_value("auto_time_pct", f"{stats['auto_time_pct']:.1f}")
+        self.set_metric_card_value("takeover_count", f"{stats['takeover_count']}")
+        self.set_metric_card_value("mode_change_count", f"{stats['mode_change_count']}")
+        self.set_metric_card_value("brake_event_count", f"{stats['brake_event_count']}")
+        self.set_metric_card_value("harsh_brake_count", f"{stats['harsh_brake_count']}")
+        self.set_metric_card_value("mean_lat", f"{stats['mean_lat']:.3f}")
+        self.set_metric_card_value("rms_lat", f"{stats['rms_lat']:.3f}")
+        self.set_metric_card_value("max_lat", f"{stats['max_lat']:.3f}")
+        self.set_metric_card_value("mean_vel_err", f"{stats['mean_vel_err']:.3f}")
+
+        if hasattr(self, "report") and self.report is not None:
+            self.report.setText(self.generate_text_report())
+
+        if self.analysis_interval_status is not None:
+            self.analysis_interval_status.setText(self.analysis_interval_text())
+
+    def create_summary_tab(self):
         widget = QWidget()
         layout = QVBoxLayout()
         self.summary_layout = layout
-
-        auto_dist_pct = 0.0
-        if r.distance_total > 1e-6:
-            auto_dist_pct = 100.0 * r.autonomous_distance / r.distance_total
-
-        auto_time_pct = 0.0
-        if r.total_time > 1e-6:
-            auto_time_pct = 100.0 * r.autonomous_time / r.total_time
-
-        mean_lat = self.mean_value(r.lateral_errors)
-        max_lat = self.max_value(r.lateral_errors)
-        rms_lat = self.rms_value(r.lateral_errors)
-
-        mean_vel_err = self.mean_abs_value(r.velocity_errors)
-        max_vel_err = self.max_abs_value(r.velocity_errors)
+        stats = self.summary_stats()
 
         grid = QGridLayout()
         self.summary_grid = grid
 
-        grid.addWidget(self.create_metric_card("Total Distance", f"{r.distance_total:.2f}", "m", "#E3F2FD"), 0, 0)
-        grid.addWidget(self.create_metric_card("Autonomous Distance", f"{r.autonomous_distance:.2f}", "m", "#E8F5E9"), 0, 1)
-        grid.addWidget(self.create_metric_card("Autonomous Distance", f"{auto_dist_pct:.1f}", "%", "#C8E6C9"), 0, 2)
-        grid.addWidget(self.create_metric_card("Autonomous Time", f"{auto_time_pct:.1f}", "%", "#DCEDC8"), 0, 3)
+        grid.addWidget(self.create_metric_card("Total Distance", f"{stats['distance_total']:.2f}", "m", "#E3F2FD", key="distance_total"), 0, 0)
+        grid.addWidget(self.create_metric_card("Autonomous Distance", f"{stats['autonomous_distance']:.2f}", "m", "#E8F5E9", key="autonomous_distance"), 0, 1)
+        grid.addWidget(self.create_metric_card("Autonomous Distance", f"{stats['auto_dist_pct']:.1f}", "%", "#C8E6C9", key="auto_dist_pct"), 0, 2)
+        grid.addWidget(self.create_metric_card("Autonomous Time", f"{stats['auto_time_pct']:.1f}", "%", "#DCEDC8", key="auto_time_pct"), 0, 3)
 
-        grid.addWidget(self.create_metric_card("Takeovers", f"{r.takeover_count}", "", "#FFCDD2"), 1, 0)
-        grid.addWidget(self.create_metric_card("Mode Changes", f"{r.mode_change_count}", "", "#FFE0B2"), 1, 1)
-        grid.addWidget(self.create_metric_card("Brake Events", f"{len(r.brake_events)}", "", "#FFF9C4"), 1, 2)
-        grid.addWidget(self.create_metric_card("Harsh Brakes", f"{r.harsh_brake_count}", "", "#FFAB91"), 1, 3)
+        grid.addWidget(self.create_metric_card("Takeovers", f"{stats['takeover_count']}", "", "#FFCDD2", key="takeover_count"), 1, 0)
+        grid.addWidget(self.create_metric_card("Mode Changes", f"{stats['mode_change_count']}", "", "#FFE0B2", key="mode_change_count"), 1, 1)
+        grid.addWidget(self.create_metric_card("Brake Events", f"{stats['brake_event_count']}", "", "#FFF9C4", key="brake_event_count"), 1, 2)
+        grid.addWidget(self.create_metric_card("Harsh Brakes", f"{stats['harsh_brake_count']}", "", "#FFAB91", key="harsh_brake_count"), 1, 3)
 
-        grid.addWidget(self.create_metric_card("Mean Lateral Error", f"{mean_lat:.3f}", "m", "#E1F5FE"), 2, 0)
-        grid.addWidget(self.create_metric_card("RMS Lateral Error", f"{rms_lat:.3f}", "m", "#B3E5FC"), 2, 1)
-        grid.addWidget(self.create_metric_card("Max Lateral Error", f"{max_lat:.3f}", "m", "#81D4FA"), 2, 2)
-        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", f"{mean_vel_err:.3f}", "m/s", "#D1C4E9"), 2, 3)
+        grid.addWidget(self.create_metric_card("Mean Lateral Error", f"{stats['mean_lat']:.3f}", "m", "#E1F5FE", key="mean_lat"), 2, 0)
+        grid.addWidget(self.create_metric_card("RMS Lateral Error", f"{stats['rms_lat']:.3f}", "m", "#B3E5FC", key="rms_lat"), 2, 1)
+        grid.addWidget(self.create_metric_card("Max Lateral Error", f"{stats['max_lat']:.3f}", "m", "#81D4FA", key="max_lat"), 2, 2)
+        grid.addWidget(self.create_metric_card("Mean |Velocity Error|", f"{stats['mean_vel_err']:.3f}", "m/s", "#D1C4E9", key="mean_vel_err"), 2, 3)
 
         layout.addLayout(grid)
+
+        interval_layout = QHBoxLayout()
+        self.analysis_interval_status = QLabel(self.analysis_interval_text())
+        self.analysis_interval_status.setWordWrap(True)
+        exclude_interval_button = QPushButton("Exclude Analysis Interval")
+        exclude_interval_button.clicked.connect(self.exclude_analysis_interval)
+        clear_interval_button = QPushButton("Clear Analysis Interval")
+        clear_interval_button.clicked.connect(self.clear_analysis_interval)
+        interval_layout.addWidget(self.analysis_interval_status, 1)
+        interval_layout.addWidget(exclude_interval_button)
+        interval_layout.addWidget(clear_interval_button)
+        layout.addLayout(interval_layout)
 
         report = QTextEdit()
         self.report = report
@@ -1886,7 +2733,7 @@ class EvaluationGUI(QMainWindow):
 
         control_panel = QWidget()
         self.heatmap_control_panel = control_panel
-        control_panel.setMaximumHeight(190)
+        control_panel.setMaximumHeight(255)
         control_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         control_layout = QVBoxLayout()
         control_layout.setContentsMargins(0, 0, 0, 0)
@@ -1972,12 +2819,39 @@ class EvaluationGUI(QMainWindow):
         button_layout.addWidget(self.heatmap_save_button)
         button_layout.addStretch()
 
+        time_scroll_layout = QHBoxLayout()
+        self.heatmap_time_scroll = QSlider(Qt.Horizontal)
+        self.heatmap_time_scroll.setRange(0, 10000)
+        self.heatmap_time_scroll.setSingleStep(10)
+        self.heatmap_time_scroll.setPageStep(250)
+        self.heatmap_time_scroll.setEnabled(self.route_time_range()[0] is not None)
+        self.heatmap_time_scroll.setToolTip(
+            "Scroll through route time. The heatmap marker and graph cursors follow this time."
+        )
+        self.heatmap_time_scroll.valueChanged.connect(self.on_route_time_scroll_changed)
+
+        self.heatmap_time_label = QLabel("Time --")
+        self.heatmap_time_label.setMinimumWidth(95)
+        self.heatmap_time_label.setToolTip("Selected time from route start.")
+
+        time_scroll_layout.addWidget(QLabel("Route Time Scroll"))
+        time_scroll_layout.addWidget(self.heatmap_time_scroll, 1)
+        time_scroll_layout.addWidget(self.heatmap_time_label)
+
         self.heatmap_status = QLabel(
             "Enter the Autoware map origin, then generate the OSM heatmap."
         )
         self.heatmap_status.setMaximumHeight(24)
         self.heatmap_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.heatmap_status.setStyleSheet("font-size: 13px; color: #455A64; padding: 2px;")
+
+        self.time_cursor_status = QLabel(
+            "Time cursor: use a graph's Time Scroll to inspect the matching route point."
+        )
+        self.time_cursor_status.setMaximumHeight(36)
+        self.time_cursor_status.setWordWrap(True)
+        self.time_cursor_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.time_cursor_status.setStyleSheet("font-size: 13px; color: #263238; padding: 2px;")
 
         self.heatmap_fig = Figure(figsize=(10, 7), dpi=100)
         self.heatmap_canvas = FigureCanvas(self.heatmap_fig)
@@ -1998,7 +2872,9 @@ class EvaluationGUI(QMainWindow):
 
         control_layout.addLayout(controls)
         control_layout.addLayout(button_layout)
+        control_layout.addLayout(time_scroll_layout)
         control_layout.addWidget(self.heatmap_status)
+        control_layout.addWidget(self.time_cursor_status)
         control_panel.setLayout(control_layout)
 
         layout.addWidget(control_panel)
@@ -2063,6 +2939,8 @@ class EvaluationGUI(QMainWindow):
             self.heatmap_status.setText("Rendering heatmap...")
             QApplication.processEvents()
 
+            self.heatmap_marker = None
+            self.heatmap_marker_label = None
             heatmap_stats = draw_osm_heatmap(
                 self.heatmap_fig,
                 global_samples,
@@ -2076,6 +2954,17 @@ class EvaluationGUI(QMainWindow):
                 alpha=alpha,
                 cmap=cmap,
             )
+            self.heatmap_global_samples = global_samples
+            self.heatmap_pose_times = np.array(
+                [sample["pose"].t for sample in global_samples],
+                dtype=float,
+            )
+
+            if self.selected_time is None and self.heatmap_global_samples:
+                self.set_selected_time(self.heatmap_global_samples[0]["pose"].t)
+            else:
+                self.update_heatmap_time_marker()
+
             self.apply_adaptive_styles(force=True)
             self.heatmap_canvas.draw()
             self.heatmap_save_button.setEnabled(True)
@@ -2084,9 +2973,14 @@ class EvaluationGUI(QMainWindow):
                     f"Rendered operation mode route with {heatmap_stats['sample_count']} samples."
                 )
             else:
+                outlier_text = ""
+                if heatmap_stats.get("outlier_count", 0) > 0:
+                    outlier_text = f", excluded {heatmap_stats['outlier_count']} outliers"
+
                 self.heatmap_status.setText(
                     f"Rendered {metric}: {heatmap_stats['sample_count']} samples, "
-                    f"color range {heatmap_stats['vmin']:.3g} to {heatmap_stats['vmax']:.3g}."
+                    f"color range {heatmap_stats['vmin']:.3g} to {heatmap_stats['vmax']:.3g}"
+                    f"{outlier_text}."
                 )
 
         except Exception as exc:
@@ -2305,88 +3199,100 @@ class EvaluationGUI(QMainWindow):
         return widget
 
     def mean_value(self, data):
-        if not data:
+        values = self.filtered_metric_values(data)
+        if len(values) == 0:
             return 0.0
-        return float(np.mean([p[1] for p in data]))
+        return float(np.mean(values))
 
     def mean_abs_value(self, data):
-        if not data:
+        values = self.filtered_metric_values(data)
+        if len(values) == 0:
             return 0.0
-        return float(np.mean(np.abs([p[1] for p in data])))
+        return float(np.mean(np.abs(values)))
 
     def max_value(self, data):
-        if not data:
+        values = self.filtered_metric_values(data)
+        if len(values) == 0:
             return 0.0
-        return float(np.max([p[1] for p in data]))
+        return float(np.max(values))
 
     def max_abs_value(self, data):
-        if not data:
+        values = self.filtered_metric_values(data)
+        if len(values) == 0:
             return 0.0
-        return float(np.max(np.abs([p[1] for p in data])))
+        return float(np.max(np.abs(values)))
 
     def rms_value(self, data):
-        if not data:
+        values = self.filtered_metric_values(data)
+        if len(values) == 0:
             return 0.0
-        arr = np.array([p[1] for p in data], dtype=float)
-        return float(np.sqrt(np.mean(arr * arr)))
+        return float(np.sqrt(np.mean(values * values)))
+
+    def filtered_metric_values(self, data):
+        if not data:
+            return np.array([])
+
+        values = np.array([p[1] for p in data], dtype=float)
+        filtered = filter_outliers(values)
+        if len(filtered) == 0:
+            return values[np.isfinite(values)]
+
+        return filtered
 
     def generate_text_report(self):
         r = self.results
-
-        auto_dist_pct = 0.0
-        if r.distance_total > 1e-6:
-            auto_dist_pct = 100.0 * r.autonomous_distance / r.distance_total
-
-        auto_time_pct = 0.0
-        if r.total_time > 1e-6:
-            auto_time_pct = 100.0 * r.autonomous_time / r.total_time
-
-        mean_lat = self.mean_value(r.lateral_errors)
-        rms_lat = self.rms_value(r.lateral_errors)
-        max_lat = self.max_value(r.lateral_errors)
-
-        mean_vel_err = self.mean_abs_value(r.velocity_errors)
-        max_vel_err = self.max_abs_value(r.velocity_errors)
-
-        takeover_per_km = 0.0
-        if r.distance_total > 1e-6:
-            takeover_per_km = r.takeover_count / (r.distance_total / 1000.0)
-
-        harsh_per_km = 0.0
-        if r.distance_total > 1e-6:
-            harsh_per_km = r.harsh_brake_count / (r.distance_total / 1000.0)
+        stats = self.summary_stats()
+        interval_text = "Full route"
+        if self.analysis_interval is not None:
+            start_t, end_t = self.analysis_interval
+            origin = self.route_time_origin()
+            if self.analysis_interval_mode == "exclude":
+                interval_text = f"Excluding {start_t - origin:.2f}s to {end_t - origin:.2f}s"
+            else:
+                interval_text = f"Using {start_t - origin:.2f}s to {end_t - origin:.2f}s"
 
         text = f"""
 AUTOWARE AUTONOMOUS DRIVING EVALUATION REPORT
 
+ANALYSIS WINDOW
+---------------
+Selected interval:                  {interval_text}
+
 MISSION / ROUTE PERFORMANCE
 ---------------------------
-Total driven distance:              {r.distance_total:.2f} m
-Autonomous driven distance:         {r.autonomous_distance:.2f} m
-Autonomous distance percentage:     {auto_dist_pct:.2f} %
-Total evaluated time:               {r.total_time:.2f} s
-Autonomous time:                    {r.autonomous_time:.2f} s
-Autonomous time percentage:         {auto_time_pct:.2f} %
+Total driven distance:              {stats['distance_total']:.2f} m
+Autonomous driven distance:         {stats['autonomous_distance']:.2f} m
+Autonomous distance percentage:     {stats['auto_dist_pct']:.2f} %
+Total evaluated time:               {stats['total_time']:.2f} s
+Autonomous time:                    {stats['autonomous_time']:.2f} s
+Autonomous time percentage:         {stats['auto_time_pct']:.2f} %
 
 INTERVENTION / HANDOVER PERFORMANCE
 -----------------------------------
-Mode change count:                  {r.mode_change_count}
-Takeover count:                     {r.takeover_count}
-Takeover rate:                      {takeover_per_km:.2f} takeovers/km
+Mode change count:                  {stats['mode_change_count']}
+Takeover count:                     {stats['takeover_count']}
+Takeover rate:                      {stats['takeover_per_km']:.2f} takeovers/km
 
 TRAJECTORY TRACKING PERFORMANCE
 -------------------------------
-Mean lateral error:                 {mean_lat:.3f} m
-RMS lateral error:                  {rms_lat:.3f} m
-Maximum lateral error:              {max_lat:.3f} m
-Mean absolute velocity error:       {mean_vel_err:.3f} m/s
-Maximum absolute velocity error:    {max_vel_err:.3f} m/s
+Mean lateral error:                 {stats['mean_lat']:.3f} m
+RMS lateral error:                  {stats['rms_lat']:.3f} m
+Maximum lateral error:              {stats['max_lat']:.3f} m
+Mean absolute velocity error:       {stats['mean_vel_err']:.3f} m/s
+Maximum absolute velocity error:    {stats['max_vel_err']:.3f} m/s
 
 BRAKING / COMFORT PERFORMANCE
 -----------------------------
-Brake event count:                  {len(r.brake_events)}
-Harsh brake count:                  {r.harsh_brake_count}
-Harsh brake rate:                   {harsh_per_km:.2f} harsh brakes/km
+Brake event count:                  {stats['brake_event_count']}
+Harsh brake count:                  {stats['harsh_brake_count']}
+Harsh brake rate:                   {stats['harsh_per_km']:.2f} harsh brakes/km
+
+OUTLIER FILTERING
+-----------------
+Continuous summary metrics exclude isolated one-sample spikes only.
+Spike threshold:                     {OUTLIER_MAD_THRESHOLD:.1f} robust sigma from median
+Excluded lateral error samples:      {stats['lateral_outliers']} of {stats['lateral_sample_count']}
+Excluded velocity error samples:     {stats['velocity_outliers']} of {stats['velocity_sample_count']}
 
 PLANNING EVENTS
 ---------------
@@ -2486,8 +3392,16 @@ driver input reports, diagnostics, and stop reasons around each event.
         previous_mode = None
         previous_enabled = None
         t0 = self.results.modes[0].t if self.results.modes else 0.0
+        start_t, end_t = self.analysis_interval if self.analysis_interval is not None else (None, None)
 
         for mode in self.results.modes:
+            if start_t is not None:
+                in_interval = start_t <= mode.t <= end_t
+                if self.analysis_interval_mode == "exclude" and in_interval:
+                    continue
+                if self.analysis_interval_mode != "exclude" and not in_interval:
+                    continue
+
             enabled = bool(mode.autoware_control_enabled)
             if mode.mode != previous_mode or enabled != previous_enabled:
                 rows.append([
@@ -2501,13 +3415,14 @@ driver input reports, diagnostics, and stop reasons around each event.
         return rows
 
     def brake_event_rows(self):
-        if not self.results.brake_events:
+        brake_events = self.brake_events_in_interval()
+        if not brake_events:
             return []
 
-        t0 = self.results.brake_events[0].start_t
+        t0 = brake_events[0].start_t
         rows = []
 
-        for event in self.results.brake_events:
+        for event in brake_events:
             rows.append([
                 f"{event.start_t - t0:.2f}",
                 f"{event.end_t - t0:.2f}",
@@ -2573,22 +3488,36 @@ driver input reports, diagnostics, and stop reasons around each event.
             return
 
         r = self.results
+        stats = self.summary_stats()
+        interval_start = ""
+        interval_end = ""
+        interval_mode = "full_route"
+        if self.analysis_interval is not None:
+            interval_start, interval_end = self.analysis_interval
+            interval_mode = self.analysis_interval_mode
 
         summary = {
-            "total_distance_m": [r.distance_total],
-            "autonomous_distance_m": [r.autonomous_distance],
-            "autonomous_distance_percent": [
-                100.0 * r.autonomous_distance / r.distance_total if r.distance_total > 1e-6 else 0.0
-            ],
-            "total_time_s": [r.total_time],
-            "autonomous_time_s": [r.autonomous_time],
-            "autonomous_time_percent": [
-                100.0 * r.autonomous_time / r.total_time if r.total_time > 1e-6 else 0.0
-            ],
-            "takeover_count": [r.takeover_count],
-            "mode_change_count": [r.mode_change_count],
-            "brake_event_count": [len(r.brake_events)],
-            "harsh_brake_count": [r.harsh_brake_count],
+            "analysis_interval_mode": [interval_mode],
+            "analysis_interval_start_s": [interval_start],
+            "analysis_interval_end_s": [interval_end],
+            "total_distance_m": [stats["distance_total"]],
+            "autonomous_distance_m": [stats["autonomous_distance"]],
+            "autonomous_distance_percent": [stats["auto_dist_pct"]],
+            "total_time_s": [stats["total_time"]],
+            "autonomous_time_s": [stats["autonomous_time"]],
+            "autonomous_time_percent": [stats["auto_time_pct"]],
+            "takeover_count": [stats["takeover_count"]],
+            "mode_change_count": [stats["mode_change_count"]],
+            "brake_event_count": [stats["brake_event_count"]],
+            "harsh_brake_count": [stats["harsh_brake_count"]],
+            "mean_lateral_error_m_filtered": [stats["mean_lat"]],
+            "rms_lateral_error_m_filtered": [stats["rms_lat"]],
+            "max_lateral_error_m_filtered": [stats["max_lat"]],
+            "mean_abs_velocity_error_mps_filtered": [stats["mean_vel_err"]],
+            "max_abs_velocity_error_mps_filtered": [stats["max_vel_err"]],
+            "outlier_filter": [f"isolated spike > {OUTLIER_MAD_THRESHOLD:.1f} robust sigma from median"],
+            "lateral_error_outliers_excluded": [stats["lateral_outliers"]],
+            "velocity_error_outliers_excluded": [stats["velocity_outliers"]],
         }
 
         pd.DataFrame(summary).to_csv(os.path.join(output_dir, "summary_report.csv"), index=False)
