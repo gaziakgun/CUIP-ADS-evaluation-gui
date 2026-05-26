@@ -1,0 +1,2 @@
+[console_scripts]
+autoware_bag_eval_gui = autoware_bag_eval_gui_ros2.gui:main

@@ -1,0 +1,26 @@
+[0.567s] Invoking command in '/home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2': PYTHONPATH=/home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/build --no-deps symlink_data
+[0.778s] running develop
+[0.926s] running egg_info
+[0.926s] creating autoware_bag_eval_gui_ros2.egg-info
+[0.935s] writing autoware_bag_eval_gui_ros2.egg-info/PKG-INFO
+[0.935s] writing dependency_links to autoware_bag_eval_gui_ros2.egg-info/dependency_links.txt
+[0.935s] writing entry points to autoware_bag_eval_gui_ros2.egg-info/entry_points.txt
+[0.935s] writing requirements to autoware_bag_eval_gui_ros2.egg-info/requires.txt
+[0.935s] writing top-level names to autoware_bag_eval_gui_ros2.egg-info/top_level.txt
+[0.935s] writing manifest file 'autoware_bag_eval_gui_ros2.egg-info/SOURCES.txt'
+[0.952s] reading manifest file 'autoware_bag_eval_gui_ros2.egg-info/SOURCES.txt'
+[0.952s] writing manifest file 'autoware_bag_eval_gui_ros2.egg-info/SOURCES.txt'
+[0.980s] running build_ext
+[0.980s] Creating /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/lib/python3.10/site-packages/autoware-bag-eval-gui-ros2.egg-link (link to .)
+[0.980s] Installing autoware_bag_eval_gui script to /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/lib/autoware_bag_eval_gui_ros2
+[0.981s] 
+[0.981s] Installed /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2
+[0.981s] running symlink_data
+[0.981s] creating /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/ament_index
+[0.981s] creating /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/ament_index/resource_index
+[0.981s] creating /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/ament_index/resource_index/packages
+[0.981s] symbolically linking /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/resource/autoware_bag_eval_gui_ros2 -> /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/ament_index/resource_index/packages
+[0.981s] symbolically linking /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/package.xml -> /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/autoware_bag_eval_gui_ros2
+[0.981s] creating /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/autoware_bag_eval_gui_ros2/launch
+[0.981s] symbolically linking /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/launch/evaluation_gui.launch.py -> /home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/share/autoware_bag_eval_gui_ros2/launch
+[1.003s] Invoked command in '/home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2' returned '0': PYTHONPATH=/home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/gazi/Desktop/autoware_eval_ws/install/autoware_bag_eval_gui_ros2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/build --no-deps symlink_data
