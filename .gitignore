@@ -1,0 +1,26 @@
+cat << 'EOF' > .gitignore
+# ROS 2 / colcon generated folders
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local cache/data
+.cache/
+osm_tile_cache/
+
+# Editor/system files
+.vscode/
+.idea/
+.DS_Store
+
+# Large recorded data files
+*.bag
+*.db3
+*.mcap
+EOF
