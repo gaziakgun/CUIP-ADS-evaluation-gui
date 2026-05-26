@@ -1,7 +1,0 @@
-Metadata-Version: 2.1
-Name: autoware-bag-eval-gui-ros2
-Version: 0.1.0
-Summary: Autoware ROS 2 bag evaluation GUI with OSM heatmaps, plots, and PDF export.
-Maintainer: gazi
-Maintainer-email: gazi@example.com
-License: TODO

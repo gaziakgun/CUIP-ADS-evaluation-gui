@@ -1,1 +1,0 @@
-/home/gazi/Desktop/autoware_eval_ws/build/autoware_bag_eval_gui_ros2/launch/evaluation_gui.launch.py

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+BAG_PATH=${1:-${BAG_PATH:-test_route_03}}
 
 source_setup() {
   set +u
@@ -26,7 +27,7 @@ else
 fi
 
 ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui \
-  --bag /home/gazi/Desktop/Evaluation/test_route_03 \
+  --bag "$BAG_PATH" \
   --storage-id sqlite3 \
   --origin-lat 35.0422327201 \
   --origin-lon -85.2983169612 \

@@ -5,7 +5,7 @@ This workspace is ready to build the GUI ROS 2 package from this project.
 ## Build
 
 ```bash
-cd /home/gazi/Desktop/Evaluation/autoware_eval_ws
+cd CUIP-ADS-evaluation-gui
 source /opt/ros/$ROS_DISTRO/setup.bash
 source ~/autoware/install/setup.bash
 rosdep install --from-paths src --ignore-src -r -y
@@ -73,7 +73,13 @@ speed from the same detected vehicle objects.
 
 ```bash
 ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui \
-  --bag /home/gazi/Desktop/Evaluation/test_route_03 \
+  --bag /path/to/test_route_03 \
   --storage-id sqlite3 \
   --metric speed
+```
+
+Or use the helper script:
+
+```bash
+./run_test_route_03.sh /path/to/test_route_03
 ```
