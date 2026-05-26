@@ -3883,8 +3883,9 @@ class EvaluationGUI(QMainWindow):
         self.apply_adaptive_styles()
 
     def responsive_scale(self):
-        area_ratio = (max(self.width(), 1) * max(self.height(), 1)) / (1500.0 * 900.0)
-        return max(0.95, min(1.75, math.sqrt(area_ratio)))
+        width_ratio = max(self.width(), 1) / 1500.0
+        height_ratio = max(self.height(), 1) / 900.0
+        return max(0.78, min(1.10, min(width_ratio, height_ratio)))
 
     def apply_adaptive_styles(self, force=False):
         if not hasattr(self, "title_label"):
@@ -3959,7 +3960,7 @@ class EvaluationGUI(QMainWindow):
         for card, label_name, label_value, card_layout, color in self.metric_cards:
             card_layout.setContentsMargins(card_pad, card_pad, card_pad, card_pad)
             card_layout.setSpacing(int(8 * scale))
-            card.setMinimumHeight(int(108 * scale))
+            card.setMinimumHeight(int(88 * scale))
             card.setStyleSheet(
                 f"""
                 QWidget {{
@@ -4762,7 +4763,11 @@ class EvaluationGUI(QMainWindow):
         layout.addLayout(button_layout)
 
         widget.setLayout(layout)
-        return widget
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(widget)
+        return scroll_area
 
     def compare_table_columns(self):
         long_distance_unit = self.length_unit_label(long_distance=True)
