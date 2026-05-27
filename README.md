@@ -1,85 +1,126 @@
-# Autoware Evaluation Workspace
+# Autoware Bag Evaluation GUI
 
-This workspace is ready to build the GUI ROS 2 package from this project.
+A ROS 2 package that provides a Qt-based GUI for evaluating Autoware ROS 2 bags.
+It supports OSM heatmaps, vehicle and object metrics, plots, and bag selection from the GUI or CLI.
+This workspace contains the `autoware_bag_eval_gui_ros2` package and the helper bag recorder script.
+
+## Features
+
+- Load a ROS 2 bag directory from the GUI or via `--bag` CLI option.
+- Support for `sqlite3` and `mcap` bag storage backends.
+- OSM heatmap metrics: `speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, and `object_speed`.
+- Configurable heatmap origin, zoom, bin count, alpha, and colormap.
+- CSV/PDF export support for evaluation results.
+- GPS-triggered bag recorder script for Autoware evaluation runs.
+
+## Requirements
+
+- ROS 2 installed and sourced: `/opt/ros/$ROS_DISTRO/setup.bash`
+- `rosbag2_py` available in the ROS environment
+- Python dependencies: `PyQt5`, `matplotlib`, `pandas`, `numpy`, `requests`, `Pillow`, `pyproj`
+
+Example packages on Debian/Ubuntu:
+
+```bash
+sudo apt install python3-pyqt5 python3-matplotlib python3-pandas python3-numpy python3-requests python3-pillow python3-pyproj
+```
+
+If you are using Autoware, also source your Autoware install workspace before building:
+
+```bash
+source ~/autoware/install/setup.bash
+```
 
 ## Build
 
+From a ROS 2 workspace:
+
 ```bash
-cd CUIP-ADS-evaluation-gui
+mkdir -p ~/autoware_eval_ws/src
+cp -r /path/to/eval_ws/src/autoware_bag_eval_gui_ros2 ~/autoware_eval_ws/src/
+cd ~/autoware_eval_ws
 source /opt/ros/$ROS_DISTRO/setup.bash
-source ~/autoware/install/setup.bash
+source ~/autoware/install/setup.bash  # if using Autoware
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install --packages-select autoware_bag_eval_gui_ros2
+colcon build --packages-select autoware_bag_eval_gui_ros2
 source install/setup.bash
 ```
 
-If your Autoware install path is different, source that install workspace instead of `~/autoware/install/setup.bash`.
+## Run
 
-## Run And Select Bag In The GUI
+Start the GUI and choose a bag after launch:
+
+```bash
+ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui --storage-id sqlite3
+```
+
+Load a bag immediately:
 
 ```bash
 ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui \
-  --storage-id sqlite3
+  --bag /path/to/bag --storage-id sqlite3
 ```
 
-Or with the launch file:
+Use the available command-line options:
+
+- `--storage-id` : `sqlite3` or `mcap`
+- `--origin-lat` : OSM heatmap origin latitude
+- `--origin-lon` : OSM heatmap origin longitude
+- `--origin-yaw-deg` : OSM heatmap origin yaw
+- `--metric` : default heatmap metric (`speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, `object_speed`)
+- `--output` : default heatmap PNG save path
+- `--heatmap-zoom` : default map tile zoom level
+- `--heatmap-bins` : default number of heatmap bins
+- `--heatmap-alpha` : default heatmap overlay alpha
+- `--heatmap-cmap` : default heatmap colormap
+
+## Launch File
+
+Start the GUI with ROS 2 launch:
 
 ```bash
 ros2 launch autoware_bag_eval_gui_ros2 evaluation_gui.launch.py
 ```
 
-Use **Select Bag** in the dashboard header to choose the ROS 2 bag folder after the GUI starts.
-Use the **Units** selector in the same header to switch between metric units and US customary units (miles, feet, mph, ft/s²).
+Or pass bag and storage arguments through launch:
+
+```bash
+ros2 launch autoware_bag_eval_gui_ros2 evaluation_gui.launch.py bag:=/path/to/bag storage_id:=sqlite3
+```
 
 ## Record Bag From GPS Start/Finish Gate
 
-The recorder waits for the vehicle to pass this GNSS point, starts `ros2 bag record`, then stops after the vehicle leaves the gate and later returns through it:
-
-```text
-35.0423036111, -85.2988136944
-```
-
-Run:
+The recorder script captures evaluation topics around a GPS gate and stops when the vehicle returns.
 
 ```bash
+chmod +x record_autoware_eval_bag.sh
 ./record_autoware_eval_bag.sh
 ```
 
-Optional arguments are:
+Optional arguments:
 
 ```bash
 ./record_autoware_eval_bag.sh BAG_NAME TRIGGER_LAT TRIGGER_LON RADIUS_METERS
 ```
 
-The default radius is `5` meters, with a `10` second minimum recording time before finish detection can stop the bag. Use `GPS_TOPIC=/your/navsatfix/topic` if your GNSS fix topic is not `/sensing/novatel/oem7/fix`, and `MIN_RECORD_SECONDS=0` if you want to disable the minimum time guard.
+Defaults:
 
-The heatmap tab uses these map-frame defaults:
+- `TRIGGER_LAT`: `35.0423036111`
+- `TRIGGER_LON`: `-85.2988136944`
+- `RADIUS_METERS`: `5`
+- `MIN_RECORD_SECONDS`: `10`
+- `GPS_TOPIC`: `/sensing/novatel/oem7/fix`
 
-```text
-origin-lat: 35.0422327201
-origin-lon: -85.2983169612
-origin-yaw-deg: 0
-```
-
-The OSM heatmap metric selector also includes `object_density` and `object_speed`.
-Those use classified vehicles and pedestrians from
-`/perception/object_recognition/detection/objects`; unknown/other objects are excluded.
-For object speed, detected objects are matched to nearby tracked objects when the
-detection message does not include a usable speed.
-The Summary page also reports parked-car density, traffic density, and mean traffic
-speed from the same detected vehicle objects.
-
-## Run Test Route 03 Directly
+Override the GNSS fix topic:
 
 ```bash
-ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui \
-  --bag /path/to/test_route_03 \
-  --storage-id sqlite3 \
-  --metric speed
+GPS_TOPIC=/your/navsatfix/topic ./record_autoware_eval_bag.sh
 ```
 
-Or use the helper script:
+Disable the minimum recording time guard:
 
 ```bash
-./run_test_route_03.sh /path/to/test_route_03
+MIN_RECORD_SECONDS=0 ./record_autoware_eval_bag.sh
 ```
+
+The recorder captures available Autoware evaluation topics and reports missing topics before starting.
