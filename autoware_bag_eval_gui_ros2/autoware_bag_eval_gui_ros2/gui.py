@@ -103,6 +103,8 @@ TOPIC_DBW_ENABLED = "/raptor_dbw_interface/dbw_enabled"
 TOPIC_NOVATEL_ODOM = "/sensing/novatel/oem7/odom"
 TOPIC_OBJECTS_TRACKED = "/perception/object_recognition/tracking/objects"
 TOPIC_OBJECTS_DETECTED = "/perception/object_recognition/detection/objects"
+TOPIC_SDSM_OBJECTS = "/v2i/sdsm/objects"
+TOPIC_TF_STATIC = "/tf_static"
 
 EVALUATION_TOPICS = {
     TOPIC_LOCALIZATION,
@@ -115,6 +117,8 @@ EVALUATION_TOPICS = {
     TOPIC_BRAKE_2_REPORT,
     TOPIC_OBJECTS_TRACKED,
     TOPIC_OBJECTS_DETECTED,
+    TOPIC_SDSM_OBJECTS,
+    TOPIC_TF_STATIC,
 }
 
 HEATMAP_METRICS = [
@@ -125,8 +129,9 @@ HEATMAP_METRICS = [
     "operation_mode",
     "object_density",
     "object_speed",
+    "sdsm_object_density",
 ]
-OBJECT_HEATMAP_METRICS = {"object_density", "object_speed"}
+OBJECT_HEATMAP_METRICS = {"object_density", "object_speed", "sdsm_object_density"}
 
 OBJECT_LABEL_NAMES = {
     0: "UNKNOWN",
@@ -147,6 +152,8 @@ PEDESTRIAN_OBJECT_LABEL = 7
 DISPLAY_OBJECT_GROUPS = {"vehicle", "pedestrian"}
 PARKED_OBJECT_SPEED_THRESHOLD_MPS = 0.5
 TRAFFIC_OBJECT_SPEED_THRESHOLD_MPS = 0.5
+OBJECT_MATCH_MAX_TIME_DELTA_S = 0.30
+OBJECT_MATCH_MAX_DISTANCE_M = 5.0
 
 OUTLIER_MAD_THRESHOLD = 5.0
 OUTLIER_MIN_SAMPLES = 10
@@ -154,6 +161,20 @@ OUTLIER_MIN_SAMPLES = 10
 DEFAULT_MAP_ORIGIN_LAT = 35.0422327201
 DEFAULT_MAP_ORIGIN_LON = -85.2983169612
 DEFAULT_MAP_ORIGIN_YAW_DEG = 0.0
+
+DEFAULT_V2I_STATIC_TRANSFORM_SPECS = [
+    ("map", "v2i_intersection_14867", -44.389, 8.603, 0.0),
+    ("v2i_intersection_14867", "v2i_intersection_40386", 237.329, -108.967, 0.0),
+    ("v2i_intersection_40386", "v2i_intersection_27482", 377.081, -218.954, 0.0),
+    ("v2i_intersection_14867", "v2i_intersection_17342", -371.567, 160.854, 0.0),
+    ("v2i_intersection_17342", "v2i_intersection_24187", -243.188, 111.707, 0.0),
+    ("v2i_intersection_24187", "v2i_intersection_12753", -124.266, 52.823, 0.0),
+    ("v2i_intersection_12753", "v2i_intersection_19846", -127.057, 55.681, 0.0),
+    ("v2i_intersection_19846", "v2i_intersection_22762", -103.627, 0.433, 0.0),
+    ("v2i_intersection_22762", "v2i_intersection_51560", -96.757, -2.696, 0.0),
+    ("v2i_intersection_51560", "v2i_intersection_51572", -106.273, -0.865, 0.0),
+    ("v2i_intersection_51572", "v2i_intersection_52349", -90.909, 36.588, 0.0),
+]
 
 M_TO_FT = 3.280839895013123
 M_TO_MI = 0.000621371192237334
@@ -268,6 +289,15 @@ class ObjectSample:
 
 
 @dataclass
+class FrameTransform:
+    parent_frame_id: str
+    child_frame_id: str
+    x: float
+    y: float
+    yaw: float = 0.0
+
+
+@dataclass
 class EvalResults:
     poses: list = field(default_factory=list)
     velocities: list = field(default_factory=list)
@@ -291,6 +321,8 @@ class EvalResults:
     brake_pressure_reports: list = field(default_factory=list)
     tracked_objects: list = field(default_factory=list)
     detected_objects: list = field(default_factory=list)
+    sdsm_objects: list = field(default_factory=list)
+    frame_transforms: dict = field(default_factory=dict)
     harsh_brake_count: int = 0
     topic_types: dict = field(default_factory=dict)
     selected_topics: list = field(default_factory=list)
@@ -341,8 +373,95 @@ def angle_wrap(a):
     return a
 
 
+def default_v2i_frame_transforms():
+    return {
+        normalize_frame_id(child): FrameTransform(
+            parent_frame_id=normalize_frame_id(parent),
+            child_frame_id=normalize_frame_id(child),
+            x=float(x),
+            y=float(y),
+            yaw=float(yaw),
+        )
+        for parent, child, x, y, yaw in DEFAULT_V2I_STATIC_TRANSFORM_SPECS
+    }
+
+
+def combined_frame_transforms(results):
+    transforms = default_v2i_frame_transforms()
+    transforms.update(getattr(results, "frame_transforms", {}) or {})
+    return transforms
+
+
+def get_frame_transforms_from_msg(msg):
+    transforms = {}
+    for transform_stamped in safe_getattr(msg, "transforms", []):
+        header = safe_getattr(transform_stamped, "header", None)
+        parent = normalize_frame_id(safe_getattr(header, "frame_id", ""))
+        child = normalize_frame_id(safe_getattr(transform_stamped, "child_frame_id", ""))
+        transform = safe_getattr(transform_stamped, "transform", None)
+        translation = safe_getattr(transform, "translation", None)
+        rotation = safe_getattr(transform, "rotation", None)
+
+        if not parent or not child or translation is None or rotation is None:
+            continue
+
+        x = float(safe_getattr(translation, "x", math.nan))
+        y = float(safe_getattr(translation, "y", math.nan))
+        yaw = quaternion_to_yaw(rotation)
+        if not np.isfinite([x, y, yaw]).all():
+            continue
+
+        transforms[child] = FrameTransform(
+            parent_frame_id=parent,
+            child_frame_id=child,
+            x=x,
+            y=y,
+            yaw=yaw,
+        )
+
+    return transforms
+
+
+def transform_xy_with_frame_transform(x, y, transform):
+    cos_yaw = math.cos(transform.yaw)
+    sin_yaw = math.sin(transform.yaw)
+    return (
+        transform.x + cos_yaw * x - sin_yaw * y,
+        transform.y + sin_yaw * x + cos_yaw * y,
+    )
+
+
+def transform_xy_to_frame(x, y, source_frame, target_frame, frame_transforms):
+    source_frame = normalize_frame_id(source_frame)
+    target_frame = normalize_frame_id(target_frame)
+    if not source_frame or source_frame == target_frame:
+        return x, y
+
+    current_frame = source_frame
+    visited = set()
+    while current_frame and current_frame != target_frame:
+        if current_frame in visited:
+            return None
+        visited.add(current_frame)
+
+        transform = frame_transforms.get(current_frame)
+        if transform is None:
+            return None
+
+        x, y = transform_xy_with_frame_transform(x, y, transform)
+        current_frame = normalize_frame_id(transform.parent_frame_id)
+
+    if current_frame == target_frame:
+        return x, y
+    return None
+
+
 def safe_getattr(obj, name, default=None):
     return getattr(obj, name, default)
+
+
+def normalize_frame_id(frame_id):
+    return str(frame_id or "").strip().lstrip("/")
 
 
 def sample_times(samples):
@@ -1885,6 +2004,22 @@ def summarize_results_for_compare(results):
         auto_time_pct = 100.0 * results.autonomous_time / total_time
 
     brake_stats = brake_event_stats(results.brake_events, distance_total, total_time)
+    onboard_object_stats = object_source_detection_stats(
+        results.detected_objects,
+        distance_total,
+        "onboard",
+    )
+    sdsm_object_stats = object_source_detection_stats(
+        results.sdsm_objects,
+        distance_total,
+        "sdsm",
+    )
+    object_comparison_stats = compare_object_sources(
+        results.detected_objects,
+        results.sdsm_objects,
+        reference_poses=results.poses,
+        frame_transforms=combined_frame_transforms(results),
+    )
 
     stats = {
         "distance_total_m": distance_total,
@@ -1910,6 +2045,9 @@ def summarize_results_for_compare(results):
         "accel_sample_count": len(accel_times),
     }
     stats.update(brake_stats)
+    stats.update(onboard_object_stats)
+    stats.update(sdsm_object_stats)
+    stats.update(object_comparison_stats)
     return stats
 
 
@@ -2001,6 +2139,11 @@ def build_global_pose_samples(poses, origin_lat, origin_lon, origin_yaw_deg):
 
 
 def object_samples_for_heatmap(results, metric=None):
+    if metric == "sdsm_object_density":
+        if results.sdsm_objects:
+            return TOPIC_SDSM_OBJECTS, classified_display_objects(results.sdsm_objects)
+        return TOPIC_SDSM_OBJECTS, []
+
     if results.detected_objects:
         objects = classified_display_objects(results.detected_objects)
         if metric == "object_speed":
@@ -2071,9 +2214,155 @@ def object_detection_traffic_stats(vehicle_objects, distance_m):
     }
 
 
-def object_xy_in_map_frame(obj, reference_poses=None, pose_times=None):
-    frame_id = str(safe_getattr(obj, "frame_id", "")).lower()
-    if "base_link" not in frame_id:
+def object_source_detection_stats(objects, distance_m, prefix):
+    objects = list(objects or [])
+    comparable_objects = classified_display_objects(objects)
+    vehicle_count = sum(1 for obj in comparable_objects if obj.group == "vehicle")
+    pedestrian_count = sum(1 for obj in comparable_objects if obj.group == "pedestrian")
+    other_count = max(0, len(objects) - len(comparable_objects))
+
+    distance_km = distance_m / 1000.0 if distance_m > 1e-6 else 0.0
+    object_density = len(comparable_objects) / distance_km if distance_km > 1e-9 else 0.0
+
+    return {
+        f"{prefix}_total_object_count": len(objects),
+        f"{prefix}_object_count": len(comparable_objects),
+        f"{prefix}_vehicle_count": vehicle_count,
+        f"{prefix}_pedestrian_count": pedestrian_count,
+        f"{prefix}_other_object_count": other_count,
+        f"{prefix}_object_density_per_km": object_density,
+    }
+
+
+def object_map_records(objects, reference_poses=None, frame_transforms=None):
+    pose_times = sample_times(reference_poses) if reference_poses else None
+    records = []
+
+    for index, obj in enumerate(classified_display_objects(objects or [])):
+        x, y = object_xy_in_map_frame(
+            obj,
+            reference_poses=reference_poses,
+            pose_times=pose_times,
+            frame_transforms=frame_transforms,
+        )
+        if not np.isfinite([x, y]).all():
+            continue
+
+        records.append(
+            {
+                "index": index,
+                "object": obj,
+                "group": obj.group,
+                "t": float(obj.t),
+                "x": float(x),
+                "y": float(y),
+            }
+        )
+
+    return records
+
+
+def compare_object_sources(
+    onboard_objects,
+    sdsm_objects,
+    reference_poses=None,
+    frame_transforms=None,
+    max_dt=OBJECT_MATCH_MAX_TIME_DELTA_S,
+    max_distance_m=OBJECT_MATCH_MAX_DISTANCE_M,
+):
+    onboard_records = object_map_records(
+        onboard_objects,
+        reference_poses=reference_poses,
+        frame_transforms=frame_transforms,
+    )
+    sdsm_records = object_map_records(
+        sdsm_objects,
+        reference_poses=reference_poses,
+        frame_transforms=frame_transforms,
+    )
+
+    onboard_by_group = {"vehicle": [], "pedestrian": []}
+    for record in onboard_records:
+        onboard_by_group[record["group"]].append(record)
+
+    for group_records in onboard_by_group.values():
+        group_records.sort(key=lambda record: record["t"])
+
+    onboard_times_by_group = {
+        group: np.array([record["t"] for record in group_records], dtype=float)
+        for group, group_records in onboard_by_group.items()
+    }
+
+    used_onboard = set()
+    distances = []
+
+    for sdsm_record in sorted(sdsm_records, key=lambda record: record["t"]):
+        group = sdsm_record["group"]
+        group_records = onboard_by_group.get(group, [])
+        group_times = onboard_times_by_group.get(group, np.array([]))
+        if not group_records or len(group_times) == 0:
+            continue
+
+        left = int(np.searchsorted(group_times, sdsm_record["t"] - max_dt, side="left"))
+        right = int(np.searchsorted(group_times, sdsm_record["t"] + max_dt, side="right"))
+        if right <= left:
+            continue
+
+        best_record = None
+        best_distance = math.inf
+        for onboard_record in group_records[left:right]:
+            onboard_key = (group, onboard_record["index"])
+            if onboard_key in used_onboard:
+                continue
+
+            distance = math.hypot(
+                onboard_record["x"] - sdsm_record["x"],
+                onboard_record["y"] - sdsm_record["y"],
+            )
+            if distance < best_distance:
+                best_record = onboard_record
+                best_distance = distance
+
+        if best_record is not None and best_distance <= max_distance_m:
+            used_onboard.add((group, best_record["index"]))
+            distances.append(best_distance)
+
+    matched_count = len(distances)
+    onboard_count = len(onboard_records)
+    sdsm_count = len(sdsm_records)
+
+    return {
+        "object_match_max_dt_s": max_dt,
+        "object_match_max_distance_m": max_distance_m,
+        "onboard_object_count": onboard_count,
+        "sdsm_comparable_object_count": sdsm_count,
+        "sdsm_onboard_match_count": matched_count,
+        "sdsm_unmatched_count": max(0, sdsm_count - matched_count),
+        "onboard_unmatched_count": max(0, onboard_count - matched_count),
+        "sdsm_match_rate_pct": 100.0 * matched_count / sdsm_count if sdsm_count > 0 else 0.0,
+        "onboard_match_rate_pct": 100.0 * matched_count / onboard_count if onboard_count > 0 else 0.0,
+        "mean_object_match_distance_m": mean_or_zero(distances),
+        "median_object_match_distance_m": percentile_or_zero(distances, 50),
+        "p95_object_match_distance_m": percentile_or_zero(distances, 95),
+    }
+
+
+def object_xy_in_map_frame(obj, reference_poses=None, pose_times=None, frame_transforms=None):
+    frame_id = normalize_frame_id(safe_getattr(obj, "frame_id", ""))
+    frame_id_lower = frame_id.lower()
+
+    if frame_id and frame_id_lower not in ("map", "odom"):
+        transformed = transform_xy_to_frame(
+            obj.x,
+            obj.y,
+            frame_id,
+            "map",
+            frame_transforms or {},
+        )
+        if transformed is not None:
+            return transformed
+
+    if "base_link" not in frame_id_lower:
         return obj.x, obj.y
 
     if not reference_poses:
@@ -2199,6 +2488,7 @@ def build_global_object_samples(
     origin_lon,
     origin_yaw_deg,
     reference_poses=None,
+    frame_transforms=None,
 ):
     transformer = make_local_to_latlon_transformer(origin_lat, origin_lon)
     pose_times = sample_times(reference_poses) if reference_poses else None
@@ -2209,6 +2499,7 @@ def build_global_object_samples(
             obj,
             reference_poses=reference_poses,
             pose_times=pose_times,
+            frame_transforms=frame_transforms,
         )
         lat, lon = local_xy_to_latlon(
             map_x,
@@ -2541,9 +2832,10 @@ def draw_osm_object_heatmap(
     metric_units_override=None,
 ):
     if not object_samples:
+        source_topic = TOPIC_SDSM_OBJECTS if metric == "sdsm_object_density" else TOPIC_OBJECTS_DETECTED
         raise RuntimeError(
-            f"No classified detected vehicle or pedestrian samples found. "
-            f"Record {TOPIC_OBJECTS_DETECTED}."
+            f"No classified vehicle or pedestrian object samples found. "
+            f"Record {source_topic}."
         )
 
     fig.clear()
@@ -2552,7 +2844,7 @@ def draw_osm_object_heatmap(
     add_route_context_to_heatmap(ax, global_samples)
     sample_count = len(object_samples)
 
-    if metric == "object_density":
+    if metric in ("object_density", "sdsm_object_density"):
         legend_handles, max_density = draw_object_density_heatmap(
             ax,
             object_samples,
@@ -2562,7 +2854,7 @@ def draw_osm_object_heatmap(
         )
         vmin = 0.0
         vmax = max(1.0, max_density)
-        title = "Detected Object Density Heatmap"
+        title = "SDSM Object Density Heatmap" if metric == "sdsm_object_density" else "Detected Object Density Heatmap"
 
     elif metric == "object_speed":
         speed_unit = "m/s"
@@ -2922,6 +3214,14 @@ class AutowareBagEvaluator:
                     get_objects_from_msg(msg, fallback_time, TOPIC_OBJECTS_DETECTED)
                 )
 
+            elif topic == TOPIC_SDSM_OBJECTS:
+                self.results.sdsm_objects.extend(
+                    get_objects_from_msg(msg, fallback_time, TOPIC_SDSM_OBJECTS)
+                )
+
+            elif topic == TOPIC_TF_STATIC:
+                self.results.frame_transforms.update(get_frame_transforms_from_msg(msg))
+
         self.post_process()
 
     def post_process(self):
@@ -2936,6 +3236,7 @@ class AutowareBagEvaluator:
         r.brake_pressure_reports = sorted(r.brake_pressure_reports, key=lambda b: b.t)
         r.tracked_objects = sorted(r.tracked_objects, key=lambda obj: obj.t)
         r.detected_objects = sorted(r.detected_objects, key=lambda obj: obj.t)
+        r.sdsm_objects = sorted(r.sdsm_objects, key=lambda obj: obj.t)
 
         r.distance_total = compute_distance(r.poses)
         r.autonomous_distance = compute_autonomous_distance(r.poses, r.modes)
@@ -3740,6 +4041,9 @@ class EvaluationGUI(QMainWindow):
     def vehicle_density_unit_label(self):
         return "veh/mi" if self.use_us_units() else "veh/km"
 
+    def object_density_unit_label(self):
+        return "obj/mi" if self.use_us_units() else "obj/km"
+
     def route_distance_scale(self):
         return M_TO_MI if self.use_us_units() else 1.0
 
@@ -3783,6 +4087,10 @@ class EvaluationGUI(QMainWindow):
         value = float(value_per_km) * KM_PER_MILE if self.use_us_units() else float(value_per_km)
         return f"{value:.1f}"
 
+    def format_object_density(self, value_per_km):
+        value = float(value_per_km) * KM_PER_MILE if self.use_us_units() else float(value_per_km)
+        return f"{value:.1f}"
+
     def format_accel(self, value_mps2):
         return f"{float(self.convert_accel(value_mps2)):.2f}"
 
@@ -3806,7 +4114,14 @@ class EvaluationGUI(QMainWindow):
     def convert_compare_value(self, key, value):
         if key in ("distance_total_m", "autonomous_distance_m"):
             return float(self.convert_length(value, long_distance=True))
-        if key in ("mean_lateral_error_m", "rms_lateral_error_m", "max_lateral_error_m"):
+        if key in (
+            "mean_lateral_error_m",
+            "rms_lateral_error_m",
+            "max_lateral_error_m",
+            "mean_object_match_distance_m",
+            "median_object_match_distance_m",
+            "p95_object_match_distance_m",
+        ):
             return float(self.convert_length(value))
         if key in (
             "mean_abs_velocity_error_mps",
@@ -3828,6 +4143,8 @@ class EvaluationGUI(QMainWindow):
         if key in ("max_brake_jerk_mps3", "p95_brake_jerk_mps3"):
             return float(self.convert_jerk(value))
         if key in ("brake_events_per_km", "harsh_per_km") and self.use_us_units():
+            return float(value) * KM_PER_MILE
+        if key.endswith("_object_density_per_km") and self.use_us_units():
             return float(value) * KM_PER_MILE
         return value
 
@@ -4621,6 +4938,24 @@ class EvaluationGUI(QMainWindow):
         velocity_errors = self.time_pairs_in_interval(r.velocity_errors)
         vehicle_objects = self.samples_in_interval(detected_vehicle_objects_for_traffic(r))
         traffic_stats = object_detection_traffic_stats(vehicle_objects, distance_total)
+        onboard_objects = self.samples_in_interval(r.detected_objects)
+        sdsm_objects = self.samples_in_interval(r.sdsm_objects)
+        onboard_object_stats = object_source_detection_stats(
+            onboard_objects,
+            distance_total,
+            "onboard",
+        )
+        sdsm_object_stats = object_source_detection_stats(
+            sdsm_objects,
+            distance_total,
+            "sdsm",
+        )
+        object_comparison_stats = compare_object_sources(
+            onboard_objects,
+            sdsm_objects,
+            reference_poses=r.poses,
+            frame_transforms=combined_frame_transforms(r),
+        )
 
         auto_dist_pct = 0.0
         if distance_total > 1e-6:
@@ -4657,6 +4992,9 @@ class EvaluationGUI(QMainWindow):
         }
         stats.update(brake_stats)
         stats.update(traffic_stats)
+        stats.update(onboard_object_stats)
+        stats.update(sdsm_object_stats)
+        stats.update(object_comparison_stats)
         return stats
 
     def update_summary_display(self):
@@ -4683,6 +5021,15 @@ class EvaluationGUI(QMainWindow):
         self.set_metric_card_value("parked_vehicle_density", self.format_vehicle_density(stats["parked_vehicle_density_per_km"]))
         self.set_metric_card_value("traffic_vehicle_density", self.format_vehicle_density(stats["traffic_vehicle_density_per_km"]))
         self.set_metric_card_value("mean_traffic_speed", self.format_speed(stats["mean_traffic_speed_mps"]))
+        self.set_metric_card_value("onboard_object_count", f"{stats['onboard_object_count']}")
+        self.set_metric_card_value("sdsm_object_count", f"{stats['sdsm_object_count']}")
+        self.set_metric_card_value("sdsm_vehicle_count", f"{stats['sdsm_vehicle_count']}")
+        self.set_metric_card_value("sdsm_pedestrian_count", f"{stats['sdsm_pedestrian_count']}")
+        self.set_metric_card_value("sdsm_object_density", self.format_object_density(stats["sdsm_object_density_per_km"]))
+        self.set_metric_card_value("sdsm_match_count", f"{stats['sdsm_onboard_match_count']}")
+        self.set_metric_card_value("sdsm_match_rate", f"{stats['sdsm_match_rate_pct']:.1f}")
+        self.set_metric_card_value("mean_object_match_distance", self.format_length(stats["mean_object_match_distance_m"]))
+        self.set_metric_card_value("p95_object_match_distance", self.format_length(stats["p95_object_match_distance_m"]))
 
         if hasattr(self, "report") and self.report is not None:
             self.report.setText(self.generate_text_report())
@@ -4704,6 +5051,7 @@ class EvaluationGUI(QMainWindow):
         accel_unit = self.accel_unit_label()
         jerk_unit = self.jerk_unit_label()
         vehicle_density_unit = self.vehicle_density_unit_label()
+        object_density_unit = self.object_density_unit_label()
 
         grid.addWidget(self.create_metric_card("Total Distance", self.format_length(stats["distance_total"], long_distance=True), long_distance_unit, "#E3F2FD", key="distance_total"), 0, 0)
         grid.addWidget(self.create_metric_card("Autonomous Distance", self.format_length(stats["autonomous_distance"], long_distance=True), long_distance_unit, "#E8F5E9", key="autonomous_distance"), 0, 1)
@@ -4728,6 +5076,17 @@ class EvaluationGUI(QMainWindow):
         grid.addWidget(self.create_metric_card("Parked Car Density", self.format_vehicle_density(stats["parked_vehicle_density_per_km"]), vehicle_density_unit, "#F8BBD0", key="parked_vehicle_density"), 4, 0)
         grid.addWidget(self.create_metric_card("Traffic Density", self.format_vehicle_density(stats["traffic_vehicle_density_per_km"]), vehicle_density_unit, "#BBDEFB", key="traffic_vehicle_density"), 4, 1)
         grid.addWidget(self.create_metric_card("Mean Traffic Speed", self.format_speed(stats["mean_traffic_speed_mps"]), speed_unit, "#B2DFDB", key="mean_traffic_speed"), 4, 2)
+        grid.addWidget(self.create_metric_card("Onboard Objects", f"{stats['onboard_object_count']}", "", "#CFD8DC", key="onboard_object_count"), 4, 3)
+
+        grid.addWidget(self.create_metric_card("SDSM Objects", f"{stats['sdsm_object_count']}", "", "#D7CCC8", key="sdsm_object_count"), 5, 0)
+        grid.addWidget(self.create_metric_card("SDSM Vehicles", f"{stats['sdsm_vehicle_count']}", "", "#FFCCBC", key="sdsm_vehicle_count"), 5, 1)
+        grid.addWidget(self.create_metric_card("SDSM Pedestrians", f"{stats['sdsm_pedestrian_count']}", "", "#C5CAE9", key="sdsm_pedestrian_count"), 5, 2)
+        grid.addWidget(self.create_metric_card("SDSM Density", self.format_object_density(stats["sdsm_object_density_per_km"]), object_density_unit, "#D1C4E9", key="sdsm_object_density"), 5, 3)
+
+        grid.addWidget(self.create_metric_card("SDSM Matches", f"{stats['sdsm_onboard_match_count']}", "", "#B2DFDB", key="sdsm_match_count"), 6, 0)
+        grid.addWidget(self.create_metric_card("SDSM Match Rate", f"{stats['sdsm_match_rate_pct']:.1f}", "%", "#C8E6C9", key="sdsm_match_rate"), 6, 1)
+        grid.addWidget(self.create_metric_card("Mean Match Distance", self.format_length(stats["mean_object_match_distance_m"]), length_unit, "#B3E5FC", key="mean_object_match_distance"), 6, 2)
+        grid.addWidget(self.create_metric_card("P95 Match Distance", self.format_length(stats["p95_object_match_distance_m"]), length_unit, "#81D4FA", key="p95_object_match_distance"), 6, 3)
 
         layout.addLayout(grid)
 
@@ -4776,6 +5135,7 @@ class EvaluationGUI(QMainWindow):
         accel_unit = self.accel_unit_label()
         jerk_unit = self.jerk_unit_label()
         rate_unit = self.rate_distance_label()
+        object_density_unit = self.object_density_unit_label()
         return [
             ("Bag", "label", None),
             ("Storage", "storage_id", None),
@@ -4799,6 +5159,12 @@ class EvaluationGUI(QMainWindow):
             (f"Max |Vel Err| [{speed_unit}]", "max_abs_velocity_error_mps", "{:.3f}"),
             ("Mean |Heading| [deg]", "mean_abs_heading_error_deg", "{:.3f}"),
             ("Max |Heading| [deg]", "max_abs_heading_error_deg", "{:.3f}"),
+            ("Onboard Objects", "onboard_object_count", "{:.0f}"),
+            ("SDSM Objects", "sdsm_object_count", "{:.0f}"),
+            (f"SDSM Density [{object_density_unit}]", "sdsm_object_density_per_km", "{:.1f}"),
+            ("SDSM Match [%]", "sdsm_match_rate_pct", "{:.1f}"),
+            (f"Mean Match [{length_unit}]", "mean_object_match_distance_m", "{:.3f}"),
+            (f"P95 Match [{length_unit}]", "p95_object_match_distance_m", "{:.3f}"),
             (f"Mean Speed [{speed_unit}]", "mean_speed_mps", "{:.3f}"),
             (f"Max Speed [{speed_unit}]", "max_speed_mps", "{:.3f}"),
             (f"Mean |Accel| [{accel_unit}]", "mean_abs_accel_mps2", "{:.3f}"),
@@ -4815,6 +5181,7 @@ class EvaluationGUI(QMainWindow):
         accel_unit = self.accel_unit_label()
         jerk_unit = self.jerk_unit_label()
         rate_unit = self.rate_distance_label()
+        object_density_unit = self.object_density_unit_label()
         return [
             ("RMS lateral error", "rms_lateral_error_m", f"RMS lateral error [{length_unit}]"),
             ("Mean lateral error", "mean_lateral_error_m", f"Mean lateral error [{length_unit}]"),
@@ -4835,6 +5202,11 @@ class EvaluationGUI(QMainWindow):
             ("95th brake decel", "p95_brake_decel_mps2", f"95th brake decel [{accel_unit}]"),
             ("Max brake jerk", "max_brake_jerk_mps3", f"Max brake jerk [{jerk_unit}]"),
             ("Max speed drop", "max_speed_drop_mps", f"Max speed drop [{speed_unit}]"),
+            ("SDSM objects", "sdsm_object_count", "SDSM objects"),
+            ("SDSM object density", "sdsm_object_density_per_km", f"SDSM object density [{object_density_unit}]"),
+            ("SDSM match rate", "sdsm_match_rate_pct", "SDSM match rate [%]"),
+            ("Mean object match distance", "mean_object_match_distance_m", f"Mean object match distance [{length_unit}]"),
+            ("P95 object match distance", "p95_object_match_distance_m", f"P95 object match distance [{length_unit}]"),
             ("Mean speed", "mean_speed_mps", f"Mean speed [{speed_unit}]"),
             ("Max speed", "max_speed_mps", f"Max speed [{speed_unit}]"),
             ("Mean abs acceleration", "mean_abs_accel_mps2", f"Mean |acceleration| [{accel_unit}]"),
@@ -5299,14 +5671,15 @@ class EvaluationGUI(QMainWindow):
                 origin_lon,
                 origin_yaw_deg,
             )
+            frame_transforms = combined_frame_transforms(self.results)
             object_global_samples = []
             object_source_topic = ""
             if metric in OBJECT_HEATMAP_METRICS:
                 object_source_topic, source_objects = object_samples_for_heatmap(self.results, metric)
                 if not source_objects:
                     raise RuntimeError(
-                        f"No classified detected vehicle or pedestrian samples found. "
-                        f"Record {TOPIC_OBJECTS_DETECTED}."
+                        f"No classified vehicle or pedestrian samples found. "
+                        f"Record {object_source_topic}."
                     )
                 object_global_samples = build_global_object_samples(
                     source_objects,
@@ -5314,6 +5687,7 @@ class EvaluationGUI(QMainWindow):
                     origin_lon,
                     origin_yaw_deg,
                     reference_poses=self.results.poses,
+                    frame_transforms=frame_transforms,
                 )
                 if not object_global_samples:
                     raise RuntimeError("No valid object positions found for heatmap.")
@@ -5861,6 +6235,7 @@ class EvaluationGUI(QMainWindow):
         speed_unit = self.speed_unit_label()
         rate_distance_unit = self.rate_distance_label()
         vehicle_density_unit = self.vehicle_density_unit_label()
+        object_density_unit = self.object_density_unit_label()
         takeover_rate = self.rate_per_display_distance(stats["takeover_count"], stats["distance_total"])
         brake_rate = self.rate_per_display_distance(stats["brake_event_count"], stats["distance_total"])
         harsh_rate = self.rate_per_display_distance(stats["harsh_brake_count"], stats["distance_total"])
@@ -5902,6 +6277,24 @@ Traffic density:                    {self.format_vehicle_density(stats['traffic_
 Mean traffic speed:                 {self.format_speed(stats['mean_traffic_speed_mps'])} {speed_unit}
 Parked vehicle detections:          {stats['parked_vehicle_count']}
 Moving traffic detections:          {stats['traffic_vehicle_count']}
+
+SDSM / ONBOARD OBJECT COMPARISON
+--------------------------------
+Onboard comparable detections:      {stats['onboard_object_count']}
+SDSM comparable detections:         {stats['sdsm_object_count']}
+SDSM total detections:              {stats['sdsm_total_object_count']}
+SDSM vehicle detections:            {stats['sdsm_vehicle_count']}
+SDSM pedestrian detections:         {stats['sdsm_pedestrian_count']}
+SDSM object density:                {self.format_object_density(stats['sdsm_object_density_per_km'])} {object_density_unit}
+Matched SDSM to onboard detections: {stats['sdsm_onboard_match_count']}
+SDSM match rate:                    {stats['sdsm_match_rate_pct']:.2f} %
+Onboard match rate:                 {stats['onboard_match_rate_pct']:.2f} %
+Unmatched SDSM detections:          {stats['sdsm_unmatched_count']}
+Unmatched onboard detections:       {stats['onboard_unmatched_count']}
+Mean match distance:                {self.format_length(stats['mean_object_match_distance_m'])} {length_unit}
+Median match distance:              {self.format_length(stats['median_object_match_distance_m'])} {length_unit}
+95th percentile match distance:     {self.format_length(stats['p95_object_match_distance_m'])} {length_unit}
+Match gate:                         {stats['object_match_max_dt_s']:.2f} s and {self.format_length(stats['object_match_max_distance_m'])} {length_unit}
 
 BRAKING / COMFORT PERFORMANCE
 -----------------------------
@@ -6174,11 +6567,29 @@ driver input reports, diagnostics, and stop reasons around each event.
             "autonomous_time_percent": [stats["auto_time_pct"]],
             "takeover_count": [stats["takeover_count"]],
             "mode_change_count": [stats["mode_change_count"]],
+            "onboard_object_count": [stats["onboard_object_count"]],
+            "onboard_total_object_count": [stats["onboard_total_object_count"]],
             "parked_vehicle_detection_count": [stats["parked_vehicle_count"]],
             "traffic_vehicle_detection_count": [stats["traffic_vehicle_count"]],
             "parked_vehicle_density_per_km": [stats["parked_vehicle_density_per_km"]],
             "traffic_vehicle_density_per_km": [stats["traffic_vehicle_density_per_km"]],
             "mean_traffic_speed_mps": [stats["mean_traffic_speed_mps"]],
+            "sdsm_total_object_count": [stats["sdsm_total_object_count"]],
+            "sdsm_comparable_object_count": [stats["sdsm_object_count"]],
+            "sdsm_vehicle_count": [stats["sdsm_vehicle_count"]],
+            "sdsm_pedestrian_count": [stats["sdsm_pedestrian_count"]],
+            "sdsm_other_object_count": [stats["sdsm_other_object_count"]],
+            "sdsm_object_density_per_km": [stats["sdsm_object_density_per_km"]],
+            "sdsm_onboard_match_count": [stats["sdsm_onboard_match_count"]],
+            "sdsm_match_rate_percent": [stats["sdsm_match_rate_pct"]],
+            "onboard_match_rate_percent": [stats["onboard_match_rate_pct"]],
+            "sdsm_unmatched_count": [stats["sdsm_unmatched_count"]],
+            "onboard_unmatched_count": [stats["onboard_unmatched_count"]],
+            "mean_object_match_distance_m": [stats["mean_object_match_distance_m"]],
+            "median_object_match_distance_m": [stats["median_object_match_distance_m"]],
+            "p95_object_match_distance_m": [stats["p95_object_match_distance_m"]],
+            "object_match_max_dt_s": [stats["object_match_max_dt_s"]],
+            "object_match_max_distance_m": [stats["object_match_max_distance_m"]],
             "brake_event_count": [stats["brake_event_count"]],
             "brake_event_source": [self.brake_event_source_text()],
             "brake_events_per_km": [stats["brake_events_per_km"]],
@@ -6225,6 +6636,44 @@ driver input reports, diagnostics, and stop reasons around each event.
                 os.path.join(output_dir, "velocity_errors.csv"),
                 index=False,
             )
+
+        if r.detected_objects:
+            pd.DataFrame(
+                [
+                    {
+                        "time_s": sample.t,
+                        "x_m": sample.x,
+                        "y_m": sample.y,
+                        "speed_mps": sample.speed,
+                        "label": sample.label,
+                        "label_name": sample.label_name,
+                        "group": sample.group,
+                        "probability": sample.probability,
+                        "frame_id": sample.frame_id,
+                        "source_topic": sample.source_topic,
+                    }
+                    for sample in r.detected_objects
+                ]
+            ).to_csv(os.path.join(output_dir, "onboard_detected_objects.csv"), index=False)
+
+        if r.sdsm_objects:
+            pd.DataFrame(
+                [
+                    {
+                        "time_s": sample.t,
+                        "x_m": sample.x,
+                        "y_m": sample.y,
+                        "speed_mps": sample.speed,
+                        "label": sample.label,
+                        "label_name": sample.label_name,
+                        "group": sample.group,
+                        "probability": sample.probability,
+                        "frame_id": sample.frame_id,
+                        "source_topic": sample.source_topic,
+                    }
+                    for sample in r.sdsm_objects
+                ]
+            ).to_csv(os.path.join(output_dir, "sdsm_detected_objects.csv"), index=False)
 
         if r.brake_events:
             brake_rows = []

@@ -8,7 +8,8 @@ This workspace contains the `autoware_bag_eval_gui_ros2` package and the helper 
 
 - Load a ROS 2 bag directory from the GUI or via `--bag` CLI option.
 - Support for `sqlite3` and `mcap` bag storage backends.
-- OSM heatmap metrics: `speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, and `object_speed`.
+- OSM heatmap metrics: `speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, `object_speed`, and `sdsm_object_density`.
+- SDSM object evaluation from `/v2i/sdsm/objects`, including SDSM object counts, density, and nearest-object comparison metrics against onboard perception detections.
 - Configurable heatmap origin, zoom, bin count, alpha, and colormap.
 - CSV/PDF export support for evaluation results.
 - GPS-triggered bag recorder script for Autoware evaluation runs.
@@ -67,7 +68,7 @@ Use the available command-line options:
 - `--origin-lat` : OSM heatmap origin latitude
 - `--origin-lon` : OSM heatmap origin longitude
 - `--origin-yaw-deg` : OSM heatmap origin yaw
-- `--metric` : default heatmap metric (`speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, `object_speed`)
+- `--metric` : default heatmap metric (`speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, `object_speed`, `sdsm_object_density`)
 - `--output` : default heatmap PNG save path
 - `--heatmap-zoom` : default map tile zoom level
 - `--heatmap-bins` : default number of heatmap bins
@@ -124,3 +125,4 @@ MIN_RECORD_SECONDS=0 ./record_autoware_eval_bag.sh
 ```
 
 The recorder captures available Autoware evaluation topics and reports missing topics before starting.
+When present, it also records `/v2i/sdsm/objects` and `/tf_static` so SDSM object heatmaps and onboard-vs-SDSM comparison metrics can be generated.

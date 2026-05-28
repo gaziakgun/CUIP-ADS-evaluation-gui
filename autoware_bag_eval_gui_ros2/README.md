@@ -8,7 +8,8 @@ plot vehicle and object metrics, and export evaluation results.
 
 - GUI-based bag selection and immediate bag loading.
 - Support for `sqlite3` and `mcap` ROS 2 bag storage backends.
-- Heatmap metrics: `speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, and `object_speed`.
+- Heatmap metrics: `speed`, `lateral_error`, `brake`, `density`, `operation_mode`, `object_density`, `object_speed`, and `sdsm_object_density`.
+- SDSM object counts, density, and nearest-object comparison metrics against onboard perception from `/v2i/sdsm/objects`.
 - Configurable map origin and heatmap rendering options.
 - Launch file support via `evaluation_gui.launch.py`.
 
@@ -54,7 +55,7 @@ ros2 run autoware_bag_eval_gui_ros2 autoware_bag_eval_gui \
 - `--origin-lat`: OSM heatmap origin latitude
 - `--origin-lon`: OSM heatmap origin longitude
 - `--origin-yaw-deg`: OSM heatmap origin yaw
-- `--metric`: default heatmap metric
+- `--metric`: default heatmap metric, including `sdsm_object_density`
 - `--output`: default heatmap PNG save path
 - `--heatmap-zoom`: default OSM tile zoom
 - `--heatmap-bins`: default heatmap bin count
@@ -86,6 +87,6 @@ origin-yaw-deg: 0
 ## Notes
 
 The heatmap object metrics use classified vehicles and pedestrians from
-`/perception/object_recognition/detection/objects`.
+`/perception/object_recognition/detection/objects` and `/v2i/sdsm/objects`.
 Unknown/other object labels are excluded. `object_speed` uses tracked object matches
 when a detection message does not supply usable speed.

@@ -59,6 +59,10 @@ TOPICS=(
   # Perception
   "/perception/object_recognition/detection/objects"
   "/perception/object_recognition/tracking/objects"
+  "/v2i/sdsm/objects"
+
+  # Static transforms for V2I intersection object frames
+  "/tf_static"
 
   # Planning stop reasons
   "/planning/scenario_planning/status/stop_reasons"
