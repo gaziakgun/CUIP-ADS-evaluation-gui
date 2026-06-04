@@ -88,12 +88,21 @@ from pyproj import Transformer
 # Topic configuration
 # ============================================================
 
+TOPIC_AUTOWARE_ENGAGE = "/autoware/engage"
+TOPIC_AUTOWARE_STATE = "/autoware/state"
 TOPIC_LOCALIZATION = "/localization/kinematic_state"
 TOPIC_TRAJECTORY = "/planning/scenario_planning/trajectory"
 TOPIC_CONTROL_CMD = "/control/command/control_cmd"
 TOPIC_VELOCITY = "/vehicle/status/velocity_status"
-TOPIC_OPERATION_MODE =  "/vehicle/status/control_mode"
+TOPIC_OPERATION_MODE = "/vehicle/status/control_mode"
+TOPIC_OPERATION_MODE_STATE = "/system/operation_mode/state"
+TOPIC_OPERATION_MODE_AVAILABILITY = "/system/operation_mode/availability"
 TOPIC_STOP_REASONS = "/planning/scenario_planning/status/stop_reasons"
+TOPIC_PLANNING_ROUTE = "/planning/route"
+TOPIC_PLANNING_ROUTE_STATE = "/planning/route_state"
+TOPIC_MISSION_PLANNING_STATE = "/planning/mission_planning/state"
+TOPIC_MISSION_PLANNING_ROUTE = "/planning/mission_planning/route"
+TOPIC_TURN_INDICATORS_CMD = "/planning/turn_indicators_cmd"
 
 TOPIC_DRIVER_INPUT = "/raptor_dbw_interface/driver_input_report"
 TOPIC_BRAKE_CMD = "/raptor_dbw_interface/brake_cmd"
@@ -103,22 +112,66 @@ TOPIC_DBW_ENABLED = "/raptor_dbw_interface/dbw_enabled"
 TOPIC_NOVATEL_ODOM = "/sensing/novatel/oem7/odom"
 TOPIC_OBJECTS_TRACKED = "/perception/object_recognition/tracking/objects"
 TOPIC_OBJECTS_DETECTED = "/perception/object_recognition/detection/objects"
+TOPIC_OBJECTS = "/perception/object_recognition/objects"
 TOPIC_SDSM_OBJECTS = "/v2i/sdsm/objects"
 TOPIC_TF_STATIC = "/tf_static"
 
+TOPIC_EMERGENCY_CONTROL_CMD = "/system/emergency/control_cmd"
+TOPIC_EMERGENCY_GEAR_CMD = "/system/emergency/gear_cmd"
+TOPIC_EMERGENCY_HAZARD_LIGHTS_CMD = "/system/emergency/hazard_lights_cmd"
+TOPIC_EMERGENCY_HAZARD_STATUS = "/system/emergency/hazard_status"
+TOPIC_FAIL_SAFE_MRM_STATE = "/system/fail_safe/mrm_state"
+TOPIC_MRM_COMFORTABLE_STOP_STATUS = "/system/mrm/comfortable_stop/status"
+TOPIC_MRM_EMERGENCY_STOP_STATUS = "/system/mrm/emergency_stop/status"
+TOPIC_MRM_PULL_OVER_MANAGER_STATUS = "/system/mrm/pull_over_manager/status"
+
 EVALUATION_TOPICS = {
+    TOPIC_AUTOWARE_ENGAGE,
+    TOPIC_AUTOWARE_STATE,
     TOPIC_LOCALIZATION,
     TOPIC_TRAJECTORY,
     TOPIC_CONTROL_CMD,
     TOPIC_VELOCITY,
     TOPIC_OPERATION_MODE,
+    TOPIC_OPERATION_MODE_STATE,
+    TOPIC_OPERATION_MODE_AVAILABILITY,
     TOPIC_STOP_REASONS,
+    TOPIC_PLANNING_ROUTE,
+    TOPIC_PLANNING_ROUTE_STATE,
+    TOPIC_MISSION_PLANNING_STATE,
+    TOPIC_MISSION_PLANNING_ROUTE,
+    TOPIC_TURN_INDICATORS_CMD,
     TOPIC_BRAKE_REPORT,
     TOPIC_BRAKE_2_REPORT,
     TOPIC_OBJECTS_TRACKED,
     TOPIC_OBJECTS_DETECTED,
+    TOPIC_OBJECTS,
     TOPIC_SDSM_OBJECTS,
     TOPIC_TF_STATIC,
+    TOPIC_EMERGENCY_CONTROL_CMD,
+    TOPIC_EMERGENCY_GEAR_CMD,
+    TOPIC_EMERGENCY_HAZARD_LIGHTS_CMD,
+    TOPIC_EMERGENCY_HAZARD_STATUS,
+    TOPIC_FAIL_SAFE_MRM_STATE,
+    TOPIC_MRM_COMFORTABLE_STOP_STATUS,
+    TOPIC_MRM_EMERGENCY_STOP_STATUS,
+    TOPIC_MRM_PULL_OVER_MANAGER_STATUS,
+}
+
+GENERIC_EVENT_TOPICS = {
+    TOPIC_AUTOWARE_ENGAGE,
+    TOPIC_AUTOWARE_STATE,
+    TOPIC_OPERATION_MODE_STATE,
+    TOPIC_OPERATION_MODE_AVAILABILITY,
+    TOPIC_EMERGENCY_CONTROL_CMD,
+    TOPIC_EMERGENCY_GEAR_CMD,
+    TOPIC_EMERGENCY_HAZARD_LIGHTS_CMD,
+    TOPIC_EMERGENCY_HAZARD_STATUS,
+    TOPIC_FAIL_SAFE_MRM_STATE,
+    TOPIC_MRM_COMFORTABLE_STOP_STATUS,
+    TOPIC_MRM_EMERGENCY_STOP_STATUS,
+    TOPIC_MRM_PULL_OVER_MANAGER_STATUS,
+    TOPIC_STOP_REASONS,
 }
 
 HEATMAP_METRICS = [
@@ -298,12 +351,21 @@ class FrameTransform:
 
 
 @dataclass
+class NotableEvent:
+    t: float
+    category: str
+    description: str
+    source_topic: str = ""
+
+
+@dataclass
 class EvalResults:
     poses: list = field(default_factory=list)
     velocities: list = field(default_factory=list)
     controls: list = field(default_factory=list)
     modes: list = field(default_factory=list)
     trajectories: list = field(default_factory=list)
+    events: list = field(default_factory=list)
 
     lateral_errors: list = field(default_factory=list)
     heading_errors: list = field(default_factory=list)
@@ -3214,10 +3276,20 @@ class AutowareBagEvaluator:
                     get_objects_from_msg(msg, fallback_time, TOPIC_OBJECTS_DETECTED)
                 )
 
+            elif topic == TOPIC_OBJECTS:
+                self.results.detected_objects.extend(
+                    get_objects_from_msg(msg, fallback_time, TOPIC_OBJECTS)
+                )
+
             elif topic == TOPIC_SDSM_OBJECTS:
                 self.results.sdsm_objects.extend(
                     get_objects_from_msg(msg, fallback_time, TOPIC_SDSM_OBJECTS)
                 )
+
+            elif topic in GENERIC_EVENT_TOPICS:
+                event = get_event_from_msg(topic, msg, fallback_time)
+                if event is not None:
+                    self.results.events.append(event)
 
             elif topic == TOPIC_TF_STATIC:
                 self.results.frame_transforms.update(get_frame_transforms_from_msg(msg))
@@ -3257,6 +3329,11 @@ class AutowareBagEvaluator:
             r.brake_events = compute_brake_events(r.velocities)
         r.harsh_brake_count = sum(1 for e in r.brake_events if e.event_type == "HARSH")
 
+        r.events.extend(mode_change_events(r.modes))
+        r.events.extend(brake_event_notable_events(r.brake_events))
+        r.events.extend(compute_acceleration_events(r.velocities))
+        r.events.sort(key=lambda e: e.t)
+
         self.compute_tracking_errors()
 
     def compute_tracking_errors(self):
@@ -3291,6 +3368,155 @@ class AutowareBagEvaluator:
                     actual_v = velocity_values[idx]
                     velocity_error = target_v - actual_v
                     r.velocity_errors.append((pose.t, velocity_error))
+
+
+def mode_change_events(modes):
+    events = []
+    previous_mode = None
+    previous_enabled = None
+    for mode in modes:
+        enabled = bool(mode.autoware_control_enabled)
+        if mode.mode != previous_mode or enabled != previous_enabled:
+            description = f"Mode: {mode.mode}. Autoware control {'enabled' if enabled else 'disabled'}."
+            events.append(
+                NotableEvent(
+                    t=mode.t,
+                    category="Mode Change",
+                    description=description,
+                    source_topic=TOPIC_OPERATION_MODE,
+                )
+            )
+            previous_mode = mode.mode
+            previous_enabled = enabled
+    return events
+
+
+def brake_event_notable_events(brake_events):
+    events = []
+    for event in brake_events:
+        description = f"{event.event_type.capitalize()} braking"
+        if np.isfinite(event.peak_signal):
+            description += f" ({event.signal_name} {event.peak_signal:.2f} {event.signal_unit})"
+        if event.harsh_reasons:
+            description += f" [{event.harsh_reasons}]"
+        events.append(
+            NotableEvent(
+                t=event.start_t,
+                category="Brake",
+                description=description,
+                source_topic=event.source,
+            )
+        )
+    return events
+
+
+def compute_acceleration_events(velocities, accel_threshold=2.0, min_duration=0.3):
+    if len(velocities) < 5:
+        return []
+
+    ts = np.array([v.t for v in velocities], dtype=float)
+    vs = np.array([v.v for v in velocities], dtype=float)
+    order = np.argsort(ts)
+    ts = ts[order]
+    vs = vs[order]
+
+    dt = np.diff(ts)
+    dv = np.diff(vs)
+    valid = dt > 1e-3
+    accel = np.zeros_like(dv)
+    accel[valid] = dv[valid] / dt[valid]
+
+    events = []
+    in_event = False
+    start_idx = 0
+    for i, a in enumerate(accel):
+        if a > accel_threshold and not in_event:
+            in_event = True
+            start_idx = i
+
+        if in_event and (a <= 0.5 or i == len(accel) - 1):
+            end_idx = i
+            start_t = float(ts[start_idx])
+            end_t = float(ts[min(end_idx + 1, len(ts) - 1)])
+            duration = end_t - start_t
+            if duration >= min_duration:
+                peak_accel = float(np.max(accel[start_idx : end_idx + 1]))
+                events.append(
+                    NotableEvent(
+                        t=start_t,
+                        category="Acceleration",
+                        description=f"Quick acceleration (peak {peak_accel:.2f} m/s^2)",
+                        source_topic=TOPIC_VELOCITY,
+                    )
+                )
+            in_event = False
+    return events
+
+
+def get_event_from_msg(topic, msg, fallback_time):
+    t = fallback_time
+    if hasattr(msg, "stamp"):
+        t = stamp_to_sec(msg.stamp)
+    elif hasattr(msg, "header"):
+        t = stamp_to_sec(msg.header.stamp)
+
+    description = summarize_message_for_event(topic, msg)
+    category = event_category_for_topic(topic)
+    if not description:
+        return None
+
+    return NotableEvent(
+        t=t,
+        category=category,
+        description=description,
+        source_topic=topic,
+    )
+
+
+def event_category_for_topic(topic):
+    if topic.startswith("/system/emergency"):
+        return "Emergency"
+    if topic.startswith("/system/fail_safe") or topic.startswith("/system/mrm"):
+        return "Safety"
+    if topic == TOPIC_STOP_REASONS:
+        return "Stop Reason"
+    if topic == TOPIC_AUTOWARE_ENGAGE or topic == TOPIC_AUTOWARE_STATE:
+        return "Autoware"
+    if topic.startswith("/system/operation_mode"):
+        return "Operation Mode"
+    return "Event"
+
+
+def summarize_message_for_event(topic, msg):
+    values = []
+    for field_name in (
+        "mode",
+        "state",
+        "status",
+        "enabled",
+        "data",
+        "command",
+        "action",
+        "reason",
+        "description",
+        "control",
+        "value",
+    ):
+        if hasattr(msg, field_name):
+            value = safe_getattr(msg, field_name)
+            if value is not None:
+                if isinstance(value, bool):
+                    values.append(f"{field_name}={value}")
+                else:
+                    values.append(f"{field_name}={value}")
+    if values:
+        return ", ".join(values)
+
+    if hasattr(msg, "objects"):
+        count = len(safe_getattr(msg, "objects", []))
+        return f"Detected {count} objects"
+
+    return None
 
 
 # ============================================================
@@ -6147,31 +6373,29 @@ class EvaluationGUI(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
 
-        mode_events = []
-        previous_mode = None
-        previous_enabled = None
-
-        for m in self.results.modes:
-            enabled = bool(m.autoware_control_enabled)
-            if m.mode != previous_mode or enabled != previous_enabled:
-                mode_events.append(m)
-                previous_mode = m.mode
-                previous_enabled = enabled
-
         table = QTableWidget()
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["Time [s]", "Mode / Control Change", "Autoware Control Enabled"])
-        table.setRowCount(len(mode_events))
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Time [s]", "Category", "Description", "Source Topic"])
+        table.setRowCount(len(self.results.events))
 
-        if self.results.modes:
+        if self.results.events:
+            t0 = self.results.events[0].t
+        elif self.results.modes:
             t0 = self.results.modes[0].t
         else:
             t0 = 0.0
 
-        for row, m in enumerate(mode_events):
-            table.setItem(row, 0, QTableWidgetItem(f"{m.t - t0:.2f}"))
-            table.setItem(row, 1, QTableWidgetItem(m.mode))
-            table.setItem(row, 2, QTableWidgetItem(str(m.autoware_control_enabled)))
+        for row, event in enumerate(self.results.events):
+            table.setItem(row, 0, QTableWidgetItem(f"{event.t - t0:.2f}"))
+            table.setItem(row, 1, QTableWidgetItem(event.category))
+            table.setItem(row, 2, QTableWidgetItem(event.description))
+            table.setItem(row, 3, QTableWidgetItem(event.source_topic))
+
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setAlternatingRowColors(True)
 
         layout.addWidget(table)
         widget.setLayout(layout)

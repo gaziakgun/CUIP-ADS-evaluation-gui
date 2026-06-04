@@ -37,35 +37,88 @@ echo "=============================================="
 
 TOPICS=(
 
-  # Localization / vehicle pose
-  "/localization/kinematic_state"
-
-  # Planned trajectory
-  "/planning/scenario_planning/trajectory"
-
-  # Control command
-  "/control/command/control_cmd"
-
-  # Vehicle velocity
-  "/vehicle/status/velocity_status"
- 
-
-  # Autoware operation mode
+  # Autonomy / engagement / operation mode
+  "/autoware/engage"
+  "/autoware/state"
+  "/vehicle/engage"
   "/vehicle/status/control_mode"
+  "/system/operation_mode/state"
+  "/system/operation_mode/availability"
+  "/system/component_state_monitor/component/autonomous/control"
+  "/system/component_state_monitor/component/autonomous/localization"
+  "/system/component_state_monitor/component/autonomous/perception"
+  "/system/component_state_monitor/component/autonomous/planning"
+  "/system/component_state_monitor/component/autonomous/sensing"
+  "/system/component_state_monitor/component/autonomous/system"
+  "/system/component_state_monitor/component/autonomous/vehicle"
 
-  # Diagnostics
-  "/diagnostics"
-
-  # Perception
-  "/perception/object_recognition/detection/objects"
-  "/perception/object_recognition/tracking/objects"
-  "/v2i/sdsm/objects"
-
-  # Static transforms for V2I intersection object frames
+  # Localization / vehicle pose
+  "/localization/initialization_state"
+  "/localization/pose_with_covariance"
+  "/localization/kinematic_state"
+  "/localization/twist_estimator/twist_with_covariance"
+  "/localization/pose_estimator/pose"
+  "/tf"
   "/tf_static"
 
-  # Planning stop reasons
-  "/planning/scenario_planning/status/stop_reasons"
+  # Planned trajectory / route / mission planning
+  "/planning/scenario_planning/trajectory"
+  "/planning/trajectory"
+  "/planning/route"
+  "/planning/route_state"
+  "/planning/mission_planning/state"
+  "/planning/mission_planning/route"
+  "/planning/turn_indicators_cmd"
+  "/planning/remaining_distance_time_calculator/debug/processing_time_detail_ms"
+  "/planning/remaining_distance_time"
+
+  # Control command and actuation
+  "/control/command/control_cmd"
+  "/control/command/gear_cmd"
+  "/control/command/hazard_lights_cmd"
+  "/control/command/turn_indicators_cmd"
+  "/control/trajectory_follower/control_cmd"
+
+  # Perception / objects / tracking
+  "/perception/object_recognition/detection/objects"
+  "/perception/object_recognition/objects"
+  "/perception/object_recognition/tracking/objects"
+  "/perception/object_recognition/prediction/map_based_prediction/objects"
+  "/perception/obstacle_segmentation/pointcloud"
+  "/sensing/lidar/concatenated/pointcloud"
+  "/sensing/points"
+
+  # Safety / emergency / fail-safe
+  "/api/autoware/get/emergency"
+  "/system/emergency/control_cmd"
+  "/system/emergency/gear_cmd"
+  "/system/emergency/hazard_lights_cmd"
+  "/system/emergency/hazard_status"
+  "/system/fail_safe/mrm_state"
+  "/system/mrm/comfortable_stop/status"
+  "/system/mrm/emergency_stop/status"
+  "/system/mrm/pull_over_manager/status"
+
+  # Diagnostics / system health
+  "/diagnostics"
+  "/diagnostics_graph/status"
+  "/diagnostics_graph/struct"
+  "/system/system_monitor/cpu_monitor/cpu_usage"
+  "/system/system_monitor/mem_monitor/memory_status"
+  "/system/system_monitor/hdd_monitor/hdd_status"
+  "/system/system_monitor/net_monitor/network_status"
+  "/system/pipeline_latency_monitor/debug/planning_latency_ms"
+  "/system/pipeline_latency_monitor/output/total_latency_ms"
+  "/control/control_validator/validation_status"
+  "/planning/planning_validator/validation_status"
+
+  # Vehicle status and metrics
+  "/vehicle/status/velocity_status"
+  "/vehicle/status/steering_status"
+  "/vehicle/status/hazard_lights_status"
+  "/vehicle/status/gear_status"
+  "/vehicle/status/battery_charge"
+  "/vehicle/doors/status"
 
   # NovAtel / GNSS / INS topics
   "/sensing/novatel/oem7/fix"
